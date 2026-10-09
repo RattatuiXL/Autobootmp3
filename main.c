@@ -30,6 +30,8 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define OUT_FRAMES   1152
 #define RING_BLOCKS  20            /* about 0.5 s of audio buffered           */
 #define PREBUFFER    6             /* blocks to collect before (re)starting   */
+#define OUT_HZ       44100         /* normal PSP audio channel rate           */
+#define OUT_VOLUME   0x6000        /* 75 percent, avoids clipping             */
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
 
@@ -41,7 +43,6 @@ static unsigned char buf[BUF_SZ] __attribute__((aligned(64)));
 static short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME] __attribute__((aligned(64)));
 
 static short ring[RING_BLOCKS][OUT_FRAMES * 2] __attribute__((aligned(64)));
-static int ring_hz[RING_BLOCKS];
 static volatile unsigned int ring_head = 0;   /* written by decoder thread */
 static volatile unsigned int ring_tail = 0;   /* written by output thread  */
 static volatile int flush_req = 0;
@@ -84,7 +85,7 @@ static void write_log(void)
     put_s(" max "); put_n(st_dec_max); put_s("   (must stay under about 26000)\r\n");
     put_s("file read time max (us): "); put_n(st_read_max); put_s("\r\n");
     put_s("audio block time (us): avg "); put_n(st_out_cnt ? st_out_sum / st_out_cnt : 0);
-    put_s(" max "); put_n(st_out_max); put_s("   (1152 / sample rate: 36000 at 32000 Hz, 26122 at 44100 Hz)\r\n");
+    put_s(" max "); put_n(st_out_max); put_s("   (expected about 26122)\r\n");
     put_s("buffered blocks min: "); put_n(st_ring_min); put_s(" of 20\r\n");
     put_s("underruns so far: "); put_n(st_underrun); put_s("\r\n");
     put_s("audio channel failures: "); put_n(st_resfail); put_s("\r\n");
@@ -176,7 +177,7 @@ static void scan(void)
 /* ---- output thread: plays ring buffer blocks, reads the Note button ---- */
 static int output_thread(SceSize args, void *argp)
 {
-    int ch_hz = 0, buffering = 1;
+    int ch = -1, buffering = 1;
 
     while (1) {
         poll_button();
@@ -201,21 +202,18 @@ static int output_thread(SceSize args, void *argp)
         }
 
         int slot = ring_tail % RING_BLOCKS;
-        int hz = ring_hz[slot];
-        if (hz != ch_hz) {
-            if (ch_hz) sceAudioSRCChRelease();
-            ch_hz = 0;
-            if (sceAudioSRCChReserve(OUT_FRAMES, hz, 2) < 0) {
+        if (ch < 0) {
+            ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, OUT_FRAMES, PSP_AUDIO_FORMAT_STEREO);
+            if (ch < 0) {
                 st_resfail++;
                 sceKernelDelayThread(500000);
                 continue;
             }
-            ch_hz = hz;
         }
         if (avail < st_ring_min) st_ring_min = avail;
         unsigned int ta = sceKernelGetSystemTimeLow();
         sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
-        sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, ring[slot]);
+        sceAudioOutputBlocking(ch, OUT_VOLUME, ring[slot]);
         unsigned int tb = sceKernelGetSystemTimeLow() - ta;
         st_out_cnt++; st_out_sum += tb; if (tb > st_out_max) st_out_max = tb;
         ring_tail++;
@@ -241,21 +239,40 @@ static int wait_space(void)   /* returns 1 if a button command arrived */
     return 0;
 }
 
+static int rs_phase = 0;                 /* 16.16 fixed point          */
+static int prev_l = 0, prev_r = 0;
+
+static int emit_out(short l, short r)    /* returns 1 if a command arrived */
+{
+    if (blk_fill == 0 && wait_space()) return 1;
+    short *dst = ring[ring_head % RING_BLOCKS];
+    dst[blk_fill * 2]     = l;
+    dst[blk_fill * 2 + 1] = r;
+    if (++blk_fill == OUT_FRAMES) {
+        __sync_synchronize();
+        ring_head++;
+        blk_fill = 0;
+    }
+    return 0;
+}
+
+/* converts any MP3 sample rate to 44100 Hz (linear interpolation) */
 static int push_frames(const short *p, int frames, int ch, int hz)
 {
+    int step = (int)((((unsigned int)hz) << 16) / OUT_HZ);
     for (int i = 0; i < frames; i++) {
-        if (blk_fill == 0 && wait_space()) return 1;
-        short *dst = ring[ring_head % RING_BLOCKS];
-        short l = p[i * ch];
-        short r = (ch == 2) ? p[i * ch + 1] : l;
-        dst[blk_fill * 2]     = l;
-        dst[blk_fill * 2 + 1] = r;
-        if (++blk_fill == OUT_FRAMES) {
-            ring_hz[ring_head % RING_BLOCKS] = hz;
-            __sync_synchronize();
-            ring_head++;
-            blk_fill = 0;
+        int l = p[i * ch];
+        int r = (ch == 2) ? p[i * ch + 1] : l;
+        while (rs_phase < 65536) {
+            int f = rs_phase >> 1;
+            short ol = (short)(prev_l + (((l - prev_l) * f) >> 15));
+            short orr = (short)(prev_r + (((r - prev_r) * f) >> 15));
+            if (emit_out(ol, orr)) return 1;
+            rs_phase += step;
         }
+        rs_phase -= 65536;
+        prev_l = l;
+        prev_r = r;
     }
     return 0;
 }
@@ -269,6 +286,8 @@ static int play_file(const char *path)
     mp3dec_init(&dec);
     int pos = 0, filled = 0, eof = 0, need_more = 0, result = CMD_NONE, tick = 0;
     blk_fill = 0;
+    rs_phase = 0;
+    prev_l = prev_r = 0;
 
     while (1) {
         if (cmd != CMD_NONE) { result = cmd; cmd = CMD_NONE; break; }
