@@ -277,6 +277,21 @@ static int push_frames(const short *p, int frames, int ch, int hz)
     return 0;
 }
 
+/* TEST: plays a clean 440 Hz beep through the same output path */
+static void play_test_tone(int seconds)
+{
+    float x = 1.0f, y = 0.0f;
+    const float cw = 0.998037f, sw = 0.062648f;   /* 440 Hz at 44100 Hz */
+    int n = OUT_HZ * seconds;
+    for (int i = 0; i < n; i++) {
+        float nx = x * cw - y * sw;
+        y = x * sw + y * cw;
+        x = nx;
+        short v = (short)(y * 8000.0f);
+        if (emit_out(v, v)) return;
+    }
+}
+
 /* returns CMD_NONE (song ended / error), CMD_NEXT or CMD_TOGGLE */
 static int play_file(const char *path)
 {
@@ -345,6 +360,13 @@ static int decoder_thread(SceSize args, void *argp)
 {
     flush_to_zero();
     sceKernelDelayThread(START_DELAY);
+
+    /* TEST: beep 1 at 222 MHz, beep 2 at 333 MHz, then the music */
+    scePowerSetClockFrequency(222, 222, 111);
+    play_test_tone(3);
+    scePowerSetClockFrequency(333, 333, 166);
+    play_test_tone(3);
+
     scan();
     if (nfiles == 0) return 0;
 
