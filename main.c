@@ -4,7 +4,7 @@
  *   Note button, single press : next song
  *   Note button, double press : stop (press once to resume)
  *
- * Runs the CPU at 222 MHz: at 333 MHz the PSP-1000 adds white noise to the sound.
+ * Runs the CPU at a low clock: at 333 MHz the PSP-1000 adds white noise to the sound.
  * Two threads: a decoder thread fills a ring buffer, an output thread plays it.
  */
 #include <pspkernel.h>
@@ -32,7 +32,7 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define PREBUFFER    6             /* blocks to collect before (re)starting   */
 #define OUT_HZ       44100         /* normal PSP audio channel rate           */
 #define OUT_VOLUME   0x8000        /* full volume (use the PSP volume keys)   */
-#define CPU_MHZ      222
+#define CPU_MHZ      133           /* low clock = less noise; decoding needs little CPU */
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
 
@@ -49,6 +49,34 @@ static volatile unsigned int ring_tail = 0;   /* written by output thread  */
 static volatile int flush_req = 0;
 static volatile int cmd = CMD_NONE;
 static int blk_fill = 0;
+
+static unsigned int st_hz = 0, st_kbps = 0;
+static char lg[256];
+static int lg_n = 0;
+
+static void put_s(const char *s)
+{
+    while (*s && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = *s++;
+}
+
+static void put_n(unsigned int v)
+{
+    char t[12];
+    int i = 0;
+    if (v == 0) t[i++] = '0';
+    while (v) { t[i++] = '0' + (v % 10); v /= 10; }
+    while (i && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = t[--i];
+}
+
+static void write_log(void)
+{
+    lg_n = 0;
+    put_s("cpu MHz: "); put_n(scePowerGetCpuClockFrequency());
+    put_s("  bus MHz: "); put_n(scePowerGetBusClockFrequency());
+    put_s("  song: "); put_n(st_hz); put_s(" Hz, "); put_n(st_kbps); put_s(" kbps\r\n");
+    SceUID f = sceIoOpen("ms0:/AutoMusic.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (f >= 0) { sceIoWrite(f, lg, lg_n); sceIoClose(f); }
+}
 
 static void set_cpu_speed(void)
 {
@@ -174,7 +202,7 @@ static void flush_ring(void)
 
 static int wait_space(void)   /* returns 1 if a button command arrived */
 {
-    while ((ring_head - ring_tail) >= RING_BLOCKS) {
+    while ((ring_head - ring_tail) >= RING_BLOCKS - 2) {
         if (cmd != CMD_NONE) return 1;
         sceKernelDelayThread(3000);
     }
@@ -250,6 +278,7 @@ static int play_file(const char *path)
 
         mp3dec_frame_info_t info;
         int samples = mp3dec_decode_frame(&dec, buf + pos, avail, pcm, &info);
+        if (samples > 0) { st_hz = info.hz; st_kbps = info.bitrate_kbps; }
 
         if (info.frame_bytes > 0)  pos += info.frame_bytes;
         else if (eof)              break;
@@ -262,9 +291,12 @@ static int play_file(const char *path)
             break;
         }
 
-        /* keep the CPU at 222 MHz if something raised it (333 MHz = noise) */
-        if ((++tick & 255) == 0 && scePowerGetCpuClockFrequency() > CPU_MHZ + 10)
-            set_cpu_speed();
+        /* keep the CPU clock low if something raised it (333 MHz = noise) */
+        if ((++tick & 255) == 0) {
+            if (scePowerGetCpuClockFrequency() > CPU_MHZ + 10)
+                set_cpu_speed();
+            write_log();
+        }
     }
 
     sceIoClose(fd);
