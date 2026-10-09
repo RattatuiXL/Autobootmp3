@@ -16,9 +16,6 @@
 #include "minimp3.h"
 
 PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
-PSP_MAIN_THREAD_ATTR(0);
-PSP_MAIN_THREAD_STACK_SIZE_KB(64);
-PSP_MAIN_THREAD_PRIORITY(0x28);
 
 #define MUSIC_DIR    "ms0:/MUSIC/"
 #define DIR_LEN      11
@@ -65,6 +62,11 @@ static void poll_button(void)
 }
 
 /* ---- file list ---- */
+static void str_copy(char *dst, const char *src)
+{
+    while ((*dst++ = *src++) != 0) { }
+}
+
 static int ends_mp3(const char *s)
 {
     int n = strlen(s);
@@ -81,8 +83,8 @@ static void scan(void)
     memset(&e, 0, sizeof(e));
     while (nfiles < MAX_FILES && sceIoDread(d, &e) > 0) {
         if (ends_mp3(e.d_name) && strlen(e.d_name) < NAME_LEN - DIR_LEN - 1) {
-            strcpy(names[nfiles], MUSIC_DIR);
-            strcpy(names[nfiles] + DIR_LEN, e.d_name);
+            str_copy(names[nfiles], MUSIC_DIR);
+            str_copy(names[nfiles] + DIR_LEN, e.d_name);
             nfiles++;
         }
         memset(&e, 0, sizeof(e));
@@ -94,9 +96,9 @@ static void scan(void)
         for (int j = 0; j < nfiles - 1 - i; j++)
             if (strcmp(names[j], names[j + 1]) > 0) {
                 static char tmp[NAME_LEN];
-                strcpy(tmp, names[j]);
-                strcpy(names[j], names[j + 1]);
-                strcpy(names[j + 1], tmp);
+                str_copy(tmp, names[j]);
+                str_copy(names[j], names[j + 1]);
+                str_copy(names[j + 1], tmp);
             }
 }
 
@@ -178,7 +180,7 @@ static int play_file(const char *path)
     return result;
 }
 
-int main(int argc, char **argv)
+static int main_thread(SceSize args, void *argp)
 {
     sceKernelDelayThread(START_DELAY);
     scan();
@@ -198,5 +200,17 @@ int main(int argc, char **argv)
         if (r == CMD_TOGGLE) stopped = 1;
         else idx = (idx + 1) % nfiles;
     }
+    return 0;
+}
+
+int module_start(SceSize args, void *argp)
+{
+    SceUID th = sceKernelCreateThread("AutoMusic", main_thread, 0x28, 0x10000, 0, NULL);
+    if (th >= 0) sceKernelStartThread(th, args, argp);
+    return 0;
+}
+
+int module_stop(SceSize args, void *argp)
+{
     return 0;
 }
