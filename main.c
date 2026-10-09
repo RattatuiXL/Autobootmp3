@@ -4,8 +4,8 @@
  *   Note button, single press : next song
  *   Note button, double press : stop (press once to resume)
  *
- * Two threads: a decoder thread fills a ring buffer, an output thread
- * plays it, so memory-stick stalls and busy moments do not cause lag.
+ * Runs the CPU at 222 MHz: at 333 MHz the PSP-1000 adds white noise to the sound.
+ * Two threads: a decoder thread fills a ring buffer, an output thread plays it.
  */
 #include <pspkernel.h>
 #include <pspctrl.h>
@@ -31,7 +31,8 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define RING_BLOCKS  20            /* about 0.5 s of audio buffered           */
 #define PREBUFFER    6             /* blocks to collect before (re)starting   */
 #define OUT_HZ       44100         /* normal PSP audio channel rate           */
-#define OUT_VOLUME   0x6000        /* 75 percent, avoids clipping             */
+#define OUT_VOLUME   0x8000        /* full volume (use the PSP volume keys)   */
+#define CPU_MHZ      222
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
 
@@ -49,62 +50,9 @@ static volatile int flush_req = 0;
 static volatile int cmd = CMD_NONE;
 static int blk_fill = 0;
 
-
-/* ---- diagnostics: writes ms0:/AutoMusic.log every few seconds ---- */
-static volatile unsigned int st_out_cnt = 0, st_out_sum = 0, st_out_max = 0;
-static volatile unsigned int st_ring_min = 99, st_underrun = 0, st_resfail = 0;
-static unsigned int st_dec_cnt = 0, st_dec_sum = 0, st_dec_max = 0, st_read_max = 0;
-static unsigned int st_hz = 0, st_ch = 0, st_kbps = 0, st_layer = 0;
-
-static char lg[1024];
-static int lg_n = 0;
-
-static void put_s(const char *s)
+static void set_cpu_speed(void)
 {
-    while (*s && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = *s++;
-}
-
-static void put_n(unsigned int v)
-{
-    char t[12];
-    int i = 0;
-    if (v == 0) t[i++] = '0';
-    while (v) { t[i++] = '0' + (v % 10); v /= 10; }
-    while (i && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = t[--i];
-}
-
-static void write_log(void)
-{
-    lg_n = 0;
-    put_s("AutoMusic stats (about the last 6 seconds)\r\n");
-    put_s("cpu MHz: "); put_n(scePowerGetCpuClockFrequency());
-    put_s("   bus MHz: "); put_n(scePowerGetBusClockFrequency()); put_s("\r\n");
-    put_s("song: "); put_n(st_hz); put_s(" Hz, channels "); put_n(st_ch);
-    put_s(", "); put_n(st_kbps); put_s(" kbps, layer "); put_n(st_layer); put_s("\r\n");
-    put_s("decode time per frame (us): avg "); put_n(st_dec_cnt ? st_dec_sum / st_dec_cnt : 0);
-    put_s(" max "); put_n(st_dec_max); put_s("   (must stay under about 26000)\r\n");
-    put_s("file read time max (us): "); put_n(st_read_max); put_s("\r\n");
-    put_s("audio block time (us): avg "); put_n(st_out_cnt ? st_out_sum / st_out_cnt : 0);
-    put_s(" max "); put_n(st_out_max); put_s("   (expected about 26122)\r\n");
-    put_s("buffered blocks min: "); put_n(st_ring_min); put_s(" of 20\r\n");
-    put_s("underruns so far: "); put_n(st_underrun); put_s("\r\n");
-    put_s("audio channel failures: "); put_n(st_resfail); put_s("\r\n");
-
-    SceUID f = sceIoOpen("ms0:/AutoMusic.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (f >= 0) { sceIoWrite(f, lg, lg_n); sceIoClose(f); }
-
-    st_dec_cnt = st_dec_sum = st_dec_max = st_read_max = 0;
-    st_out_cnt = st_out_sum = st_out_max = 0;
-    st_ring_min = 99;
-}
-
-/* make the FPU flush tiny (denormal) numbers to zero instead of trapping */
-static void flush_to_zero(void)
-{
-    unsigned int fcsr;
-    asm volatile("cfc1 %0, $31" : "=r"(fcsr));
-    fcsr |= (1u << 24);
-    asm volatile("ctc1 %0, $31" : : "r"(fcsr));
+    scePowerSetClockFrequency(CPU_MHZ, CPU_MHZ, CPU_MHZ / 2);
 }
 
 /* ---- Note button (output thread only): single = NEXT, double = TOGGLE ---- */
@@ -191,7 +139,6 @@ static int output_thread(SceSize args, void *argp)
 
         unsigned int avail = ring_head - ring_tail;
         if (avail == 0) {
-            if (!buffering) st_underrun++;
             buffering = 1;
             sceKernelDelayThread(2000);
             continue;
@@ -205,17 +152,12 @@ static int output_thread(SceSize args, void *argp)
         if (ch < 0) {
             ch = sceAudioChReserve(PSP_AUDIO_NEXT_CHANNEL, OUT_FRAMES, PSP_AUDIO_FORMAT_STEREO);
             if (ch < 0) {
-                st_resfail++;
                 sceKernelDelayThread(500000);
                 continue;
             }
         }
-        if (avail < st_ring_min) st_ring_min = avail;
-        unsigned int ta = sceKernelGetSystemTimeLow();
         sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
         sceAudioOutputBlocking(ch, OUT_VOLUME, ring[slot]);
-        unsigned int tb = sceKernelGetSystemTimeLow() - ta;
-        st_out_cnt++; st_out_sum += tb; if (tb > st_out_max) st_out_max = tb;
         ring_tail++;
     }
     return 0;
@@ -277,21 +219,6 @@ static int push_frames(const short *p, int frames, int ch, int hz)
     return 0;
 }
 
-/* TEST: plays a clean 440 Hz beep through the same output path */
-static void play_test_tone(int seconds)
-{
-    float x = 1.0f, y = 0.0f;
-    const float cw = 0.998037f, sw = 0.062648f;   /* 440 Hz at 44100 Hz */
-    int n = OUT_HZ * seconds;
-    for (int i = 0; i < n; i++) {
-        float nx = x * cw - y * sw;
-        y = x * sw + y * cw;
-        x = nx;
-        short v = (short)(y * 8000.0f);
-        if (emit_out(v, v)) return;
-    }
-}
-
 /* returns CMD_NONE (song ended / error), CMD_NEXT or CMD_TOGGLE */
 static int play_file(const char *path)
 {
@@ -313,10 +240,7 @@ static int play_file(const char *path)
                 filled -= pos;
                 pos = 0;
             }
-            unsigned int r0 = sceKernelGetSystemTimeLow();
             int n = sceIoRead(fd, buf + filled, BUF_SZ - filled);
-            unsigned int r1 = sceKernelGetSystemTimeLow() - r0;
-            if (r1 > st_read_max) st_read_max = r1;
             if (n > 0) filled += n; else eof = 1;
             need_more = 0;
         }
@@ -325,13 +249,7 @@ static int play_file(const char *path)
         if (avail <= 0) break;
 
         mp3dec_frame_info_t info;
-        unsigned int d0 = sceKernelGetSystemTimeLow();
         int samples = mp3dec_decode_frame(&dec, buf + pos, avail, pcm, &info);
-        unsigned int d1 = sceKernelGetSystemTimeLow() - d0;
-        if (samples > 0) {
-            st_dec_cnt++; st_dec_sum += d1; if (d1 > st_dec_max) st_dec_max = d1;
-            st_hz = info.hz; st_ch = info.channels; st_kbps = info.bitrate_kbps; st_layer = info.layer;
-        }
 
         if (info.frame_bytes > 0)  pos += info.frame_bytes;
         else if (eof)              break;
@@ -344,12 +262,9 @@ static int play_file(const char *path)
             break;
         }
 
-        /* keep the CPU at 333 MHz if something lowered it */
-        if ((++tick & 255) == 0) {
-            if (scePowerGetCpuClockFrequency() < 300)
-                scePowerSetClockFrequency(333, 333, 166);
-            write_log();
-        }
+        /* keep the CPU at 222 MHz if something raised it (333 MHz = noise) */
+        if ((++tick & 255) == 0 && scePowerGetCpuClockFrequency() > CPU_MHZ + 10)
+            set_cpu_speed();
     }
 
     sceIoClose(fd);
@@ -358,19 +273,11 @@ static int play_file(const char *path)
 
 static int decoder_thread(SceSize args, void *argp)
 {
-    flush_to_zero();
     sceKernelDelayThread(START_DELAY);
-
-    /* TEST: beep 1 at 222 MHz, beep 2 at 333 MHz, then the music */
-    scePowerSetClockFrequency(222, 222, 111);
-    play_test_tone(3);
-    scePowerSetClockFrequency(333, 333, 166);
-    play_test_tone(3);
-
     scan();
     if (nfiles == 0) return 0;
 
-    scePowerSetClockFrequency(333, 333, 166);
+    set_cpu_speed();
 
     int idx = 0, stopped = 0;
     while (1) {
