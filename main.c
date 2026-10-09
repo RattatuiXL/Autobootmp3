@@ -84,7 +84,7 @@ static void write_log(void)
     put_s(" max "); put_n(st_dec_max); put_s("   (must stay under about 26000)\r\n");
     put_s("file read time max (us): "); put_n(st_read_max); put_s("\r\n");
     put_s("audio block time (us): avg "); put_n(st_out_cnt ? st_out_sum / st_out_cnt : 0);
-    put_s(" max "); put_n(st_out_max); put_s("   (about 26000 expected at 44100 Hz)\r\n");
+    put_s(" max "); put_n(st_out_max); put_s("   (1152 / sample rate: 36000 at 32000 Hz, 26122 at 44100 Hz)\r\n");
     put_s("buffered blocks min: "); put_n(st_ring_min); put_s(" of 20\r\n");
     put_s("underruns so far: "); put_n(st_underrun); put_s("\r\n");
     put_s("audio channel failures: "); put_n(st_resfail); put_s("\r\n");
@@ -214,6 +214,7 @@ static int output_thread(SceSize args, void *argp)
         }
         if (avail < st_ring_min) st_ring_min = avail;
         unsigned int ta = sceKernelGetSystemTimeLow();
+        sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
         sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, ring[slot]);
         unsigned int tb = sceKernelGetSystemTimeLow() - ta;
         st_out_cnt++; st_out_sum += tb; if (tb > st_out_max) st_out_max = tb;
