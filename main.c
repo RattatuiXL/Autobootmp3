@@ -1,8 +1,11 @@
 /*
  * AutoMusic - PSP kernel plugin (ARK-4, VSH/XMB)
  * Plays every .mp3 in ms0:/MUSIC automatically after the XMB loads.
- *   Note button, short press : next song
- *   Note button, hold ~1 sec : stop (hold again or press to resume)
+ *   Note button, single press : next song
+ *   Note button, double press : stop (press once to resume)
+ *
+ * Two threads: a decoder thread fills a ring buffer, an output thread
+ * plays it, so memory-stick stalls and busy moments do not cause lag.
  */
 #include <pspkernel.h>
 #include <pspctrl.h>
@@ -20,11 +23,13 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define MUSIC_DIR    "ms0:/MUSIC/"
 #define DIR_LEN      11
 #define START_DELAY  12000000      /* wait for the XMB to finish loading (us) */
-#define HOLD_US      800000        /* hold time that counts as "stop" (us)    */
+#define DOUBLE_US    350000        /* max gap between the two presses (us)    */
 #define MAX_FILES    200
 #define NAME_LEN     128
-#define BUF_SZ       (16 * 1024)
+#define BUF_SZ       (32 * 1024)
 #define OUT_FRAMES   1152
+#define RING_BLOCKS  20            /* about 0.5 s of audio buffered           */
+#define PREBUFFER    6             /* blocks to collect before (re)starting   */
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
 
@@ -34,29 +39,37 @@ static int nfiles = 0;
 static mp3dec_t dec;
 static unsigned char buf[BUF_SZ] __attribute__((aligned(64)));
 static short pcm[MINIMP3_MAX_SAMPLES_PER_FRAME] __attribute__((aligned(64)));
-static short outbuf[OUT_FRAMES * 2] __attribute__((aligned(64)));
-static int outfill = 0;
 
-static int cmd = CMD_NONE;
-static int was_down = 0, handled = 0;
-static unsigned int t0 = 0;
+static short ring[RING_BLOCKS][OUT_FRAMES * 2] __attribute__((aligned(64)));
+static int ring_hz[RING_BLOCKS];
+static volatile unsigned int ring_head = 0;   /* written by decoder thread */
+static volatile unsigned int ring_tail = 0;   /* written by output thread  */
+static volatile int flush_req = 0;
+static volatile int cmd = CMD_NONE;
+static int blk_fill = 0;
 
-/* ---- Note button: short press = NEXT, hold = TOGGLE ---- */
+/* ---- Note button (output thread only): single = NEXT, double = TOGGLE ---- */
+static int was_down = 0, pending = 0, swallow = 0;
+static unsigned int rel_t = 0;
+
 static void poll_button(void)
 {
     SceCtrlData pad;
-    if (sceCtrlPeekBufferPositive(&pad, 1) <= 0) return;
-    int down = (pad.Buttons & PSP_CTRL_NOTE) != 0;
     unsigned int now = sceKernelGetSystemTimeLow();
 
-    if (down && !was_down) {
-        t0 = now;
-        handled = 0;
-    } else if (down && !handled && (now - t0) >= HOLD_US) {
-        handled = 1;
-        cmd = CMD_TOGGLE;
-    } else if (!down && was_down && !handled) {
+    if (pending && (now - rel_t) >= DOUBLE_US) {
+        pending = 0;
         cmd = CMD_NEXT;
+    }
+
+    if (sceCtrlPeekBufferPositive(&pad, 1) <= 0) return;
+    int down = (pad.Buttons & PSP_CTRL_NOTE) != 0;
+
+    if (down && !was_down) {
+        if (pending) { pending = 0; swallow = 1; cmd = CMD_TOGGLE; }
+    } else if (!down && was_down) {
+        if (swallow) swallow = 0;
+        else { pending = 1; rel_t = now; }
     }
     was_down = down;
 }
@@ -102,19 +115,81 @@ static void scan(void)
             }
 }
 
-/* ---- audio output: returns 1 if a button command arrived ---- */
-static int emit(const short *p, int frames, int ch)
+/* ---- output thread: plays ring buffer blocks, reads the Note button ---- */
+static int output_thread(SceSize args, void *argp)
+{
+    int ch_hz = 0, buffering = 1;
+
+    while (1) {
+        poll_button();
+
+        if (flush_req) {
+            ring_tail = ring_head;
+            buffering = 1;
+            flush_req = 0;
+            continue;
+        }
+
+        unsigned int avail = ring_head - ring_tail;
+        if (avail == 0) {
+            buffering = 1;
+            sceKernelDelayThread(2000);
+            continue;
+        }
+        if (buffering) {
+            if (avail < PREBUFFER) { sceKernelDelayThread(2000); continue; }
+            buffering = 0;
+        }
+
+        int slot = ring_tail % RING_BLOCKS;
+        int hz = ring_hz[slot];
+        if (hz != ch_hz) {
+            if (ch_hz) sceAudioSRCChRelease();
+            ch_hz = 0;
+            if (sceAudioSRCChReserve(OUT_FRAMES, hz, 2) < 0) {
+                sceKernelDelayThread(500000);
+                continue;
+            }
+            ch_hz = hz;
+        }
+        sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, ring[slot]);
+        ring_tail++;
+    }
+    return 0;
+}
+
+/* ---- decoder side ---- */
+static void flush_ring(void)
+{
+    flush_req = 1;
+    for (int i = 0; i < 500 && flush_req; i++) sceKernelDelayThread(1000);
+    if (flush_req) { ring_tail = ring_head; flush_req = 0; }
+    blk_fill = 0;
+}
+
+static int wait_space(void)   /* returns 1 if a button command arrived */
+{
+    while ((ring_head - ring_tail) >= RING_BLOCKS) {
+        if (cmd != CMD_NONE) return 1;
+        sceKernelDelayThread(3000);
+    }
+    return 0;
+}
+
+static int push_frames(const short *p, int frames, int ch, int hz)
 {
     for (int i = 0; i < frames; i++) {
+        if (blk_fill == 0 && wait_space()) return 1;
+        short *dst = ring[ring_head % RING_BLOCKS];
         short l = p[i * ch];
         short r = (ch == 2) ? p[i * ch + 1] : l;
-        outbuf[outfill * 2]     = l;
-        outbuf[outfill * 2 + 1] = r;
-        if (++outfill == OUT_FRAMES) {
-            sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, outbuf);
-            outfill = 0;
-            poll_button();
-            if (cmd != CMD_NONE) return 1;
+        dst[blk_fill * 2]     = l;
+        dst[blk_fill * 2 + 1] = r;
+        if (++blk_fill == OUT_FRAMES) {
+            ring_hz[ring_head % RING_BLOCKS] = hz;
+            __sync_synchronize();
+            ring_head++;
+            blk_fill = 0;
         }
     }
     return 0;
@@ -124,63 +199,53 @@ static int emit(const short *p, int frames, int ch)
 static int play_file(const char *path)
 {
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
-    if (fd < 0) return CMD_NONE;
+    if (fd < 0) { sceKernelDelayThread(500000); return CMD_NONE; }
 
     mp3dec_init(&dec);
-    int filled = 0, eof = 0, need_more = 0, hz = 0, result = CMD_NONE;
-    outfill = 0;
-    cmd = CMD_NONE;
+    int pos = 0, filled = 0, eof = 0, need_more = 0, result = CMD_NONE, tick = 0;
+    blk_fill = 0;
 
     while (1) {
-        if (!eof && (filled < BUF_SZ / 4 || need_more)) {
+        if (cmd != CMD_NONE) { result = cmd; cmd = CMD_NONE; break; }
+
+        if (!eof && ((filled - pos) < BUF_SZ / 2 || need_more)) {
+            if (pos > 0) {
+                memmove(buf, buf + pos, filled - pos);
+                filled -= pos;
+                pos = 0;
+            }
             int n = sceIoRead(fd, buf + filled, BUF_SZ - filled);
             if (n > 0) filled += n; else eof = 1;
             need_more = 0;
         }
-        if (filled <= 0) break;
+
+        int avail = filled - pos;
+        if (avail <= 0) break;
 
         mp3dec_frame_info_t info;
-        int samples = mp3dec_decode_frame(&dec, buf, filled, pcm, &info);
+        int samples = mp3dec_decode_frame(&dec, buf + pos, avail, pcm, &info);
 
-        if (info.frame_bytes > 0) {
-            filled -= info.frame_bytes;
-            memmove(buf, buf + info.frame_bytes, filled);
-        } else if (eof) {
+        if (info.frame_bytes > 0)  pos += info.frame_bytes;
+        else if (eof)              break;
+        else if (avail >= BUF_SZ)  pos += 1024;
+        else                       need_more = 1;
+
+        if (samples > 0 && push_frames(pcm, samples, info.channels, info.hz)) {
+            result = cmd;
+            cmd = CMD_NONE;
             break;
-        } else if (filled >= BUF_SZ) {
-            filled -= 1024;
-            memmove(buf, buf + 1024, filled);
-        } else {
-            need_more = 1;
         }
 
-        if (samples > 0) {
-            if (info.hz != hz) {
-                if (hz) sceAudioSRCChRelease();
-                hz = 0;
-                if (sceAudioSRCChReserve(OUT_FRAMES, info.hz, 2) < 0) {
-                    sceKernelDelayThread(2000000);   /* audio busy, try next song later */
-                    break;
-                }
-                hz = info.hz;
-            }
-            if (emit(pcm, samples, info.channels)) {
-                result = cmd;
-                cmd = CMD_NONE;
-                break;
-            }
-        } else {
-            poll_button();
-            if (cmd != CMD_NONE) { result = cmd; cmd = CMD_NONE; break; }
-        }
+        /* keep the CPU at 333 MHz if something lowered it */
+        if ((++tick & 255) == 0 && scePowerGetCpuClockFrequency() < 300)
+            scePowerSetClockFrequency(333, 333, 166);
     }
 
-    if (hz) sceAudioSRCChRelease();
     sceIoClose(fd);
     return result;
 }
 
-static int main_thread(SceSize args, void *argp)
+static int decoder_thread(SceSize args, void *argp)
 {
     sceKernelDelayThread(START_DELAY);
     scan();
@@ -191,22 +256,32 @@ static int main_thread(SceSize args, void *argp)
     int idx = 0, stopped = 0;
     while (1) {
         if (stopped) {
-            sceKernelDelayThread(50000);
-            poll_button();
+            sceKernelDelayThread(20000);
             if (cmd != CMD_NONE) { cmd = CMD_NONE; stopped = 0; }
             continue;
         }
+
         int r = play_file(names[idx]);
-        if (r == CMD_TOGGLE) stopped = 1;
-        else idx = (idx + 1) % nfiles;
+        if (r == CMD_TOGGLE) {
+            flush_ring();
+            stopped = 1;
+        } else if (r == CMD_NEXT) {
+            flush_ring();
+            idx = (idx + 1) % nfiles;
+        } else {
+            idx = (idx + 1) % nfiles;     /* song ended: let the buffer drain */
+        }
     }
     return 0;
 }
 
 int module_start(SceSize args, void *argp)
 {
-    SceUID th = sceKernelCreateThread("AutoMusic", main_thread, 0x28, 0x10000, 0, NULL);
-    if (th >= 0) sceKernelStartThread(th, args, argp);
+    SceUID t1 = sceKernelCreateThread("AutoMusicOut", output_thread, 0x18, 0x4000, 0, NULL);
+    if (t1 >= 0) sceKernelStartThread(t1, 0, NULL);
+
+    SceUID t2 = sceKernelCreateThread("AutoMusicDec", decoder_thread, 0x22, 0x10000, 0, NULL);
+    if (t2 >= 0) sceKernelStartThread(t2, 0, NULL);
     return 0;
 }
 
