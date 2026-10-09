@@ -1,0 +1,17 @@
+name: Build plugin
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: pspdev/pspdev:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get minimp3
+        run: |
+          URL=https://raw.githubusercontent.com/lieff/minimp3/master/minimp3.h
+          if command -v curl >/dev/null 2>&1; then curl -fsSL -o minimp3.h "$URL"; else wget -O minimp3.h "$URL"; fi
+      - run: make
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoMusic
+          path: AutoMusic.prx
