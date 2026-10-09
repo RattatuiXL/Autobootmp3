@@ -48,6 +48,64 @@ static volatile int flush_req = 0;
 static volatile int cmd = CMD_NONE;
 static int blk_fill = 0;
 
+
+/* ---- diagnostics: writes ms0:/AutoMusic.log every few seconds ---- */
+static volatile unsigned int st_out_cnt = 0, st_out_sum = 0, st_out_max = 0;
+static volatile unsigned int st_ring_min = 99, st_underrun = 0, st_resfail = 0;
+static unsigned int st_dec_cnt = 0, st_dec_sum = 0, st_dec_max = 0, st_read_max = 0;
+static unsigned int st_hz = 0, st_ch = 0, st_kbps = 0, st_layer = 0;
+
+static char lg[1024];
+static int lg_n = 0;
+
+static void put_s(const char *s)
+{
+    while (*s && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = *s++;
+}
+
+static void put_n(unsigned int v)
+{
+    char t[12];
+    int i = 0;
+    if (v == 0) t[i++] = '0';
+    while (v) { t[i++] = '0' + (v % 10); v /= 10; }
+    while (i && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = t[--i];
+}
+
+static void write_log(void)
+{
+    lg_n = 0;
+    put_s("AutoMusic stats (about the last 6 seconds)\r\n");
+    put_s("cpu MHz: "); put_n(scePowerGetCpuClockFrequency());
+    put_s("   bus MHz: "); put_n(scePowerGetBusClockFrequency()); put_s("\r\n");
+    put_s("song: "); put_n(st_hz); put_s(" Hz, channels "); put_n(st_ch);
+    put_s(", "); put_n(st_kbps); put_s(" kbps, layer "); put_n(st_layer); put_s("\r\n");
+    put_s("decode time per frame (us): avg "); put_n(st_dec_cnt ? st_dec_sum / st_dec_cnt : 0);
+    put_s(" max "); put_n(st_dec_max); put_s("   (must stay under about 26000)\r\n");
+    put_s("file read time max (us): "); put_n(st_read_max); put_s("\r\n");
+    put_s("audio block time (us): avg "); put_n(st_out_cnt ? st_out_sum / st_out_cnt : 0);
+    put_s(" max "); put_n(st_out_max); put_s("   (about 26000 expected at 44100 Hz)\r\n");
+    put_s("buffered blocks min: "); put_n(st_ring_min); put_s(" of 20\r\n");
+    put_s("underruns so far: "); put_n(st_underrun); put_s("\r\n");
+    put_s("audio channel failures: "); put_n(st_resfail); put_s("\r\n");
+
+    SceUID f = sceIoOpen("ms0:/AutoMusic.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (f >= 0) { sceIoWrite(f, lg, lg_n); sceIoClose(f); }
+
+    st_dec_cnt = st_dec_sum = st_dec_max = st_read_max = 0;
+    st_out_cnt = st_out_sum = st_out_max = 0;
+    st_ring_min = 99;
+}
+
+/* make the FPU flush tiny (denormal) numbers to zero instead of trapping */
+static void flush_to_zero(void)
+{
+    unsigned int fcsr;
+    asm volatile("cfc1 %0, $31" : "=r"(fcsr));
+    fcsr |= (1u << 24);
+    asm volatile("ctc1 %0, $31" : : "r"(fcsr));
+}
+
 /* ---- Note button (output thread only): single = NEXT, double = TOGGLE ---- */
 static int was_down = 0, pending = 0, swallow = 0;
 static unsigned int rel_t = 0;
@@ -132,6 +190,7 @@ static int output_thread(SceSize args, void *argp)
 
         unsigned int avail = ring_head - ring_tail;
         if (avail == 0) {
+            if (!buffering) st_underrun++;
             buffering = 1;
             sceKernelDelayThread(2000);
             continue;
@@ -147,145 +206,5 @@ static int output_thread(SceSize args, void *argp)
             if (ch_hz) sceAudioSRCChRelease();
             ch_hz = 0;
             if (sceAudioSRCChReserve(OUT_FRAMES, hz, 2) < 0) {
+                st_resfail++;
                 sceKernelDelayThread(500000);
-                continue;
-            }
-            ch_hz = hz;
-        }
-        sceAudioSRCOutputBlocking(PSP_AUDIO_VOLUME_MAX, ring[slot]);
-        ring_tail++;
-    }
-    return 0;
-}
-
-/* ---- decoder side ---- */
-static void flush_ring(void)
-{
-    flush_req = 1;
-    for (int i = 0; i < 500 && flush_req; i++) sceKernelDelayThread(1000);
-    if (flush_req) { ring_tail = ring_head; flush_req = 0; }
-    blk_fill = 0;
-}
-
-static int wait_space(void)   /* returns 1 if a button command arrived */
-{
-    while ((ring_head - ring_tail) >= RING_BLOCKS) {
-        if (cmd != CMD_NONE) return 1;
-        sceKernelDelayThread(3000);
-    }
-    return 0;
-}
-
-static int push_frames(const short *p, int frames, int ch, int hz)
-{
-    for (int i = 0; i < frames; i++) {
-        if (blk_fill == 0 && wait_space()) return 1;
-        short *dst = ring[ring_head % RING_BLOCKS];
-        short l = p[i * ch];
-        short r = (ch == 2) ? p[i * ch + 1] : l;
-        dst[blk_fill * 2]     = l;
-        dst[blk_fill * 2 + 1] = r;
-        if (++blk_fill == OUT_FRAMES) {
-            ring_hz[ring_head % RING_BLOCKS] = hz;
-            __sync_synchronize();
-            ring_head++;
-            blk_fill = 0;
-        }
-    }
-    return 0;
-}
-
-/* returns CMD_NONE (song ended / error), CMD_NEXT or CMD_TOGGLE */
-static int play_file(const char *path)
-{
-    SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
-    if (fd < 0) { sceKernelDelayThread(500000); return CMD_NONE; }
-
-    mp3dec_init(&dec);
-    int pos = 0, filled = 0, eof = 0, need_more = 0, result = CMD_NONE, tick = 0;
-    blk_fill = 0;
-
-    while (1) {
-        if (cmd != CMD_NONE) { result = cmd; cmd = CMD_NONE; break; }
-
-        if (!eof && ((filled - pos) < BUF_SZ / 2 || need_more)) {
-            if (pos > 0) {
-                memmove(buf, buf + pos, filled - pos);
-                filled -= pos;
-                pos = 0;
-            }
-            int n = sceIoRead(fd, buf + filled, BUF_SZ - filled);
-            if (n > 0) filled += n; else eof = 1;
-            need_more = 0;
-        }
-
-        int avail = filled - pos;
-        if (avail <= 0) break;
-
-        mp3dec_frame_info_t info;
-        int samples = mp3dec_decode_frame(&dec, buf + pos, avail, pcm, &info);
-
-        if (info.frame_bytes > 0)  pos += info.frame_bytes;
-        else if (eof)              break;
-        else if (avail >= BUF_SZ)  pos += 1024;
-        else                       need_more = 1;
-
-        if (samples > 0 && push_frames(pcm, samples, info.channels, info.hz)) {
-            result = cmd;
-            cmd = CMD_NONE;
-            break;
-        }
-
-        /* keep the CPU at 333 MHz if something lowered it */
-        if ((++tick & 255) == 0 && scePowerGetCpuClockFrequency() < 300)
-            scePowerSetClockFrequency(333, 333, 166);
-    }
-
-    sceIoClose(fd);
-    return result;
-}
-
-static int decoder_thread(SceSize args, void *argp)
-{
-    sceKernelDelayThread(START_DELAY);
-    scan();
-    if (nfiles == 0) return 0;
-
-    scePowerSetClockFrequency(333, 333, 166);
-
-    int idx = 0, stopped = 0;
-    while (1) {
-        if (stopped) {
-            sceKernelDelayThread(20000);
-            if (cmd != CMD_NONE) { cmd = CMD_NONE; stopped = 0; }
-            continue;
-        }
-
-        int r = play_file(names[idx]);
-        if (r == CMD_TOGGLE) {
-            flush_ring();
-            stopped = 1;
-        } else if (r == CMD_NEXT) {
-            flush_ring();
-            idx = (idx + 1) % nfiles;
-        } else {
-            idx = (idx + 1) % nfiles;     /* song ended: let the buffer drain */
-        }
-    }
-    return 0;
-}
-
-int module_start(SceSize args, void *argp)
-{
-    SceUID t1 = sceKernelCreateThread("AutoMusicOut", output_thread, 0x18, 0x4000, 0, NULL);
-    if (t1 >= 0) sceKernelStartThread(t1, 0, NULL);
-
-    SceUID t2 = sceKernelCreateThread("AutoMusicDec", decoder_thread, 0x22, 0x10000, 0, NULL);
-    if (t2 >= 0) sceKernelStartThread(t2, 0, NULL);
-    return 0;
-}
-
-int module_stop(SceSize args, void *argp)
-{
-    return 0;
-}
