@@ -31,7 +31,7 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define RING_BLOCKS  20            /* about 0.5 s of audio buffered           */
 #define PREBUFFER    6             /* blocks to collect before (re)starting   */
 #define OUT_HZ       44100         /* normal PSP audio channel rate           */
-#define OUT_VOLUME   0x8000        /* full volume (use the PSP volume keys)   */
+#define OUT_VOLUME   0x4000        /* full volume (use the PSP volume keys)   */
 #define CPU_MHZ      133           /* low clock = less noise; decoding needs little CPU */
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
