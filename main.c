@@ -3,13 +3,21 @@
  * Plays every .mp3 in ms0:/MUSIC automatically after the XMB loads.
  *   Note button, single press : next song
  *   Note button, double press : stop (press once to resume)
- *   Hold Note + R trigger     : plugin volume up
- *   Hold Note + L trigger     : plugin volume down
+ *   Hold Note + L trigger     : plugin volume up
+ *   Hold Note + R trigger     : plugin volume down
  * The plugin volume is separate from the PSP volume keys and is remembered.
  *
- * The CPU clock is NOT touched by default. Optionally, ms0:/SEPLUGINS/AutoMusic.cfg
- * can hold a number (33..333 = MHz used only while music plays; 0 = never touch).
- * The original clock is saved first and restored when the music is stopped.
+ * When another sound starts (video, music player, ...) the music fades out and stops;
+ * press Note once to start it again. Short menu sound effects are ignored.
+ *
+ * Decode once: a song that plays through to the end is saved as raw sound in
+ * ms0:/SEPLUGINS/AMCache/ ; the next time it plays straight from that file with no
+ * MP3 decoding at all (about 10 MB per minute of music).
+ *
+ * ms0:/SEPLUGINS/AutoMusic.cfg (created on first run) holds three numbers:
+ *   line 1: CPU MHz used only while music plays (33..333), 0 = never touch the clock
+ *   line 2: 1 = fade out when other sound starts, 0 = off
+ *   line 3: maximum size of the sound cache in MB, 0 = no cache (default 1024)
  * Two threads: a decoder thread fills a ring buffer, an output thread plays it.
  */
 #include <pspkernel.h>
@@ -41,7 +49,20 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define RING_SPARE   4             /* blocks the decoder never writes into, so it
                                       cannot overwrite what the hardware is playing */
 #define OUT_HZ       44100         /* normal PSP audio channel rate           */
+#define FADE_MAX     256
+#define FADE_OUT_STEP 6            /* per 26 ms block: about 1.1 s fade out   */
+#define FADE_IN_STEP  12           /* about 0.6 s fade in                     */
+#define BUSY_TRIGGER 800000        /* other sound must last this long (us)    */
+#define BUSY_CAP     2000000
 #define CFG_FILE     "ms0:/SEPLUGINS/AutoMusic.cfg"
+#define CACHE_DIR    "ms0:/SEPLUGINS/AMCache"
+#define BLOCK_BYTES  (OUT_FRAMES * 4)          /* one 44100 Hz stereo block */
+#define CW_SZ        (8 * BLOCK_BYTES)         /* cache write buffer        */
+#define MAGIC_OK     0x31434d41u               /* "AMC1" complete cache file */
+#define MAGIC_PART   0x30434d41u               /* "AMC0" being written       */
+#define CACHE_BATCH_MIN 8                      /* read cache in bursts of 8..12 blocks */
+#define CACHE_BATCH_MAX 12
+#define FREE_FLOOR_MB 256                      /* never fill the stick below this */
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
 
@@ -62,9 +83,39 @@ static int blk_fill = 0;
 static volatile int vol_level = VOL_MAX;      /* 0..16, plugin volume      */
 static volatile int vol_dirty = 0;
 
+static volatile int fade = FADE_MAX;          /* current fade gain 0..256  */
+static volatile int fade_target = FADE_MAX;
+static volatile int is_stopped = 0;           /* music stopped (set by decoder) */
+static volatile int autofade_on = 1;
+static volatile int detect_ready = 0;
+static volatile int auto_pause_pending = 0;
+static unsigned int ignore_mask = 0;          /* channels busy while the XMB was idle */
+
+/* ---- sound cache ---- */
+static int cache_limit_mb = 1024;                    /* 0 = off */
+static unsigned int cache_used = 0;                  /* bytes in the cache folder */
+static SceUID cache_fd = -1;                         /* file being written, or -1 */
+static int cache_bad = 0;
+static unsigned int cache_blocks = 0;
+static unsigned int cw_fill = 0;
+static unsigned char cw[CW_SZ] __attribute__((aligned(64)));
+
 /* ---- CPU clock: lowered only while music plays, original restored after ---- */
 static int clock_saved = 0, orig_cpu = 0, orig_bus = 0;
 static int cpu_target = 0;                           /* MHz, 0 = do not touch */
+
+static int next_number(const char *t, int *i, int *out)
+{
+    while (t[*i] && (t[*i] < '0' || t[*i] > '9')) (*i)++;
+    if (!t[*i]) return 0;
+    int v = 0;
+    while (t[*i] >= '0' && t[*i] <= '9') {
+        if (v < 1000) v = v * 10 + (t[*i] - '0');
+        (*i)++;
+    }
+    *out = v;
+    return 1;
+}
 
 static void load_config(void)
 {
@@ -72,7 +123,7 @@ static void load_config(void)
     SceUID f = sceIoOpen(CFG_FILE, PSP_O_RDONLY, 0);
     if (f < 0) {                                     /* first run: write the default */
         f = sceIoOpen(CFG_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-        if (f >= 0) { sceIoWrite(f, "0\r\n", 3); sceIoClose(f); }
+        if (f >= 0) { sceIoWrite(f, "0\r\n1\r\n1024\r\n", 12); sceIoClose(f); }
         return;
     }
     int n = sceIoRead(f, t, sizeof(t) - 1);
@@ -80,14 +131,15 @@ static void load_config(void)
     if (n <= 0) return;
     t[n] = 0;
 
-    int i = 0, v = 0, have = 0;
-    while (t[i] && (t[i] < '0' || t[i] > '9')) i++;
-    while (t[i] >= '0' && t[i] <= '9' && v < 1000) { v = v * 10 + (t[i] - '0'); i++; have = 1; }
-    if (!have) return;
-    if (v == 0) cpu_target = 0;
-    else if (v < 33) cpu_target = 33;
-    else if (v > 333) cpu_target = 333;
-    else cpu_target = v;
+    int i = 0, v = 0;
+    if (next_number(t, &i, &v)) {
+        if (v == 0) cpu_target = 0;
+        else if (v < 33) cpu_target = 33;
+        else if (v > 333) cpu_target = 333;
+        else cpu_target = v;
+    }
+    if (next_number(t, &i, &v)) autofade_on = (v != 0);
+    if (next_number(t, &i, &v)) cache_limit_mb = (v > 4000) ? 4000 : v;
 }
 
 static void clock_low(void)
@@ -133,7 +185,7 @@ static void save_volume_if_changed(void)
 
 /* ---- Note button (output thread only) ----
  * single press = NEXT, double press = TOGGLE,
- * Note held + R = louder, Note held + L = quieter                       */
+ * Note held + L = louder, Note held + R = quieter                       */
 static int was_down = 0, pending = 0, swallow = 0, combo = 0;
 static unsigned int rel_t = 0, vol_t = 0;
 
@@ -161,8 +213,8 @@ static void poll_button(void)
 
     if (down && !swallow) {
         int step = 0;
-        if (pad.Buttons & PSP_CTRL_RTRIGGER) step = 1;
-        else if (pad.Buttons & PSP_CTRL_LTRIGGER) step = -1;
+        if (pad.Buttons & PSP_CTRL_LTRIGGER) step = 1;        /* Note + L = louder  */
+        else if (pad.Buttons & PSP_CTRL_RTRIGGER) step = -1;  /* Note + R = quieter */
         if (step) {
             combo = 1;
             if ((now - vol_t) >= VOL_REPEAT) {
@@ -218,6 +270,153 @@ static void scan(void)
             }
 }
 
+/* ---- sound cache helpers ---- */
+typedef struct { unsigned int maxClusters, freeClusters; int unk1; unsigned int sectorSize, sectorCount; } MsInfo;
+
+static unsigned int free_mb(void)
+{
+    MsInfo info;
+    MsInfo *p = &info;
+    memset(&info, 0, sizeof(info));
+    if (sceIoDevctl("ms0:", 0x02425818, &p, sizeof(p), NULL, 0) < 0) return 0;
+    unsigned int cluster_kb = (info.sectorSize * info.sectorCount) / 1024;
+    return (info.freeClusters * cluster_kb) / 1024;
+}
+
+static void cache_init(void)
+{
+    if (cache_limit_mb <= 0) return;
+    sceIoMkdir(CACHE_DIR, 0777);
+    SceUID d = sceIoDopen(CACHE_DIR);
+    if (d < 0) { cache_limit_mb = 0; return; }       /* cannot use a cache folder */
+    SceIoDirent e;
+    memset(&e, 0, sizeof(e));
+    while (sceIoDread(d, &e) > 0) {
+        cache_used += (unsigned int)e.d_stat.st_size;
+        memset(&e, 0, sizeof(e));
+    }
+    sceIoDclose(d);
+}
+
+static void cache_path(char *out, const char *path, unsigned int size)
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned int h = 2166136261u;
+    while (*path) { h ^= (unsigned char)*path++; h *= 16777619u; }
+    h ^= size;
+    h *= 16777619u;
+    int n = 0;
+    const char *d = CACHE_DIR "/";
+    while (*d) out[n++] = *d++;
+    for (int i = 7; i >= 0; i--) out[n++] = hex[(h >> (i * 4)) & 15];
+    out[n++] = '.'; out[n++] = 'p'; out[n++] = 'c'; out[n++] = 'm'; out[n] = 0;
+}
+
+static void cache_flush(void)
+{
+    if (cw_fill && cache_fd >= 0 && !cache_bad) {
+        if (sceIoWrite(cache_fd, cw, cw_fill) != (int)cw_fill) cache_bad = 1;
+    }
+    cw_fill = 0;
+}
+
+static void cache_add(const void *block)             /* one finished 44100 Hz stereo block */
+{
+    if (cache_bad) return;
+    memcpy(cw + cw_fill, block, BLOCK_BYTES);
+    cw_fill += BLOCK_BYTES;
+    cache_blocks++;
+    if (cw_fill + BLOCK_BYTES > CW_SZ) cache_flush();
+}
+
+static void cache_begin(const char *cpath, unsigned int mp3_size)
+{
+    cache_fd = -1;
+    cache_bad = 0;
+    cache_blocks = 0;
+    cw_fill = 0;
+    if (cache_limit_mb <= 0) return;
+    if (cache_used >= (unsigned int)cache_limit_mb * 1048576u) return;   /* cache is full */
+    if (free_mb() < FREE_FLOOR_MB) return;                              /* stick nearly full */
+    SceUID f = sceIoOpen(cpath, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (f < 0) return;
+    unsigned int hdr[4] = { MAGIC_PART, mp3_size, 0, 0 };
+    if (sceIoWrite(f, hdr, 16) != 16) { sceIoClose(f); sceIoRemove(cpath); return; }
+    cache_fd = f;
+}
+
+static void cache_end(const char *cpath, unsigned int mp3_size, int complete)
+{
+    if (cache_fd < 0) return;
+    if (complete && !cache_bad) {
+        cache_flush();
+        if (!cache_bad && cache_blocks > 0) {
+            unsigned int hdr[4] = { MAGIC_OK, mp3_size, cache_blocks, 0 };
+            sceIoLseek32(cache_fd, 0, PSP_SEEK_SET);
+            if (sceIoWrite(cache_fd, hdr, 16) != 16) cache_bad = 1;
+        } else {
+            cache_bad = 1;
+        }
+    }
+    sceIoClose(cache_fd);
+    if (!complete || cache_bad) sceIoRemove(cpath);                      /* unfinished: delete */
+    else cache_used += 16 + cache_blocks * BLOCK_BYTES;
+    cache_fd = -1;
+    cw_fill = 0;
+}
+
+/* ---- detects other sound (video, music player ...) on the PSP audio channels ---- */
+static unsigned int busy_mask(int own)
+{
+    unsigned int m = 0;
+    for (int c = 0; c <= 8; c++) {
+        if (c == own) continue;
+        if (sceAudioGetChannelRestLen(c) > 0) m |= 1u << c;
+    }
+    return m;
+}
+
+static void calibrate_other_audio(void)    /* remembers channels that are always busy */
+{
+    int counts[9] = { 0 };
+    const int samples = 30;
+    for (int n = 0; n < samples; n++) {
+        unsigned int m = busy_mask(-1);
+        for (int c = 0; c <= 8; c++) if (m & (1u << c)) counts[c]++;
+        sceKernelDelayThread(50000);
+    }
+    for (int c = 0; c <= 8; c++) if (counts[c] > samples / 2) ignore_mask |= 1u << c;
+}
+
+static unsigned int busy_us = 0, last_det = 0;
+static int other_playing = 0;
+
+static void poll_other_audio(int own)
+{
+    if (!detect_ready || !autofade_on) return;
+    unsigned int now = sceKernelGetSystemTimeLow();
+    unsigned int dt = now - last_det;
+    if (dt < 50000) return;
+    last_det = now;
+    if (dt > 200000) dt = 200000;
+
+    int busy = (busy_mask(own) & ~ignore_mask) != 0;
+    if (busy) {
+        busy_us += dt;
+        if (busy_us > BUSY_CAP) busy_us = BUSY_CAP;
+    } else {
+        unsigned int d = dt * 2;
+        busy_us = (busy_us > d) ? busy_us - d : 0;
+    }
+
+    if (!other_playing && busy_us >= BUSY_TRIGGER) {
+        other_playing = 1;
+        if (!is_stopped) { fade_target = 0; auto_pause_pending = 1; }
+    } else if (other_playing && busy_us == 0) {
+        other_playing = 0;
+    }
+}
+
 /* ---- output thread: plays ring buffer blocks, reads the buttons ---- */
 static int output_thread(SceSize args, void *argp)
 {
@@ -225,6 +424,7 @@ static int output_thread(SceSize args, void *argp)
 
     while (1) {
         poll_button();
+        poll_other_audio(ch);
 
         if (flush_req) {
             ring_tail = ring_head;
@@ -236,11 +436,11 @@ static int output_thread(SceSize args, void *argp)
         unsigned int avail = ring_head - ring_tail;
         if (avail == 0) {
             buffering = 1;
-            sceKernelDelayThread(2000);
+            sceKernelDelayThread(8000);
             continue;
         }
         if (buffering) {
-            if (avail < PREBUFFER) { sceKernelDelayThread(2000); continue; }
+            if (avail < PREBUFFER) { sceKernelDelayThread(4000); continue; }
             buffering = 0;
         }
 
@@ -253,7 +453,17 @@ static int output_thread(SceSize args, void *argp)
             }
         }
         int lv = vol_level;
-        int volume = lv * lv * 128;               /* 0 .. 0x8000, finer at low levels */
+        int base = lv * lv * 128;                 /* 0 .. 0x8000, finer at low levels */
+
+        int f = fade;                             /* fade in / out, one step per block */
+        if (f > fade_target) { f -= FADE_OUT_STEP; if (f < fade_target) f = fade_target; }
+        else if (f < fade_target) { f += FADE_IN_STEP; if (f > fade_target) f = fade_target; }
+        fade = f;
+        int volume = (base * f) / FADE_MAX;
+        if (f == 0 && auto_pause_pending) {       /* faded out: stop the music */
+            auto_pause_pending = 0;
+            if (!is_stopped) cmd = CMD_TOGGLE;
+        }
         sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
         sceAudioOutputBlocking(ch, volume, ring[slot]);
         ring_tail++;
@@ -274,7 +484,7 @@ static int wait_space(void)   /* returns 1 if a button command arrived */
 {
     while ((ring_head - ring_tail) >= RING_BLOCKS - RING_SPARE) {
         if (cmd != CMD_NONE) return 1;
-        sceKernelDelayThread(3000);
+        sceKernelDelayThread(8000);
     }
     return 0;
 }
@@ -289,6 +499,7 @@ static int emit_out(short l, short r)    /* returns 1 if a command arrived */
     dst[blk_fill * 2]     = l;
     dst[blk_fill * 2 + 1] = r;
     if (++blk_fill == OUT_FRAMES) {
+        if (cache_fd >= 0) cache_add(dst);
         __sync_synchronize();
         ring_head++;
         blk_fill = 0;
@@ -317,13 +528,74 @@ static int push_frames(const short *p, int frames, int ch, int hz)
     return 0;
 }
 
+/* plays a song from its cache file (no decoding). Returns 1 if the cache file was usable. */
+static int play_cached(const char *cpath, unsigned int mp3_size, int *result)
+{
+    SceUID cf = sceIoOpen(cpath, PSP_O_RDONLY, 0);
+    if (cf < 0) return 0;
+
+    unsigned int hdr[4];
+    int fsize = sceIoLseek32(cf, 0, PSP_SEEK_END);
+    sceIoLseek32(cf, 0, PSP_SEEK_SET);
+    if (sceIoRead(cf, hdr, 16) != 16 || hdr[0] != MAGIC_OK || hdr[1] != mp3_size ||
+        hdr[2] == 0 || fsize != (int)(16 + hdr[2] * BLOCK_BYTES)) {
+        sceIoClose(cf);
+        sceIoRemove(cpath);                           /* unfinished or outdated: rebuild */
+        return 0;
+    }
+
+    unsigned int blocks_left = hdr[2];
+    int tick = 0, res = CMD_NONE;
+    blk_fill = 0;
+
+    while (blocks_left > 0) {
+        if (cmd != CMD_NONE) { res = cmd; cmd = CMD_NONE; break; }
+
+        int freeb = (RING_BLOCKS - RING_SPARE) - (int)(ring_head - ring_tail);
+        if (freeb >= CACHE_BATCH_MIN) {
+            int slot = ring_head % RING_BLOCKS;
+            int k = freeb;
+            if (k > RING_BLOCKS - slot) k = RING_BLOCKS - slot;
+            if (k > CACHE_BATCH_MAX) k = CACHE_BATCH_MAX;
+            if ((unsigned int)k > blocks_left) k = (int)blocks_left;
+            sceKernelDcacheWritebackInvalidateRange(ring[slot], k * BLOCK_BYTES);
+            int n = sceIoRead(cf, ring[slot], k * BLOCK_BYTES);
+            int got = (n > 0) ? n / BLOCK_BYTES : 0;
+            if (got == 0) break;
+            __sync_synchronize();
+            ring_head += got;
+            blocks_left -= got;
+        } else {
+            sceKernelDelayThread(15000);
+        }
+
+        if ((++tick & 15) == 0) clock_low();
+        save_volume_if_changed();
+    }
+
+    sceIoClose(cf);
+    *result = res;
+    return 1;
+}
+
 /* returns CMD_NONE (song ended / error), CMD_NEXT or CMD_TOGGLE */
 static int play_file(const char *path)
 {
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
     if (fd < 0) { sceKernelDelayThread(500000); return CMD_NONE; }
 
+    unsigned int mp3_size = (unsigned int)sceIoLseek32(fd, 0, PSP_SEEK_END);
+    sceIoLseek32(fd, 0, PSP_SEEK_SET);
+    char cpath[64];
+    cache_path(cpath, path, mp3_size);
+    if (cache_limit_mb > 0) {
+        int cres = CMD_NONE;
+        if (play_cached(cpath, mp3_size, &cres)) { sceIoClose(fd); return cres; }
+    }
+    cache_begin(cpath, mp3_size);
+
     mp3dec_init(&dec);
+    unsigned int consumed = 0;
     int pos = 0, filled = 0, eof = 0, need_more = 0, result = CMD_NONE, tick = 0;
     blk_fill = 0;
     rs_phase = 0;
@@ -349,9 +621,9 @@ static int play_file(const char *path)
         mp3dec_frame_info_t info;
         int samples = mp3dec_decode_frame(&dec, buf + pos, avail, pcm, &info);
 
-        if (info.frame_bytes > 0)  pos += info.frame_bytes;
+        if (info.frame_bytes > 0)  { pos += info.frame_bytes; consumed += info.frame_bytes; }
         else if (eof)              break;
-        else if (avail >= BUF_SZ)  pos += 1024;
+        else if (avail >= BUF_SZ)  { pos += 1024; consumed += 1024; }
         else                       need_more = 1;
 
         if (samples > 0 && push_frames(pcm, samples, info.channels, info.hz)) {
@@ -365,6 +637,7 @@ static int play_file(const char *path)
         save_volume_if_changed();
     }
 
+    cache_end(cpath, mp3_size, result == CMD_NONE && consumed >= (mp3_size / 10) * 9);
     sceIoClose(fd);
     return result;
 }
@@ -374,15 +647,24 @@ static int decoder_thread(SceSize args, void *argp)
     sceKernelDelayThread(START_DELAY);
     load_config();
     load_volume();
+    cache_init();
+    if (autofade_on) calibrate_other_audio();
+    detect_ready = 1;
     scan();
     if (nfiles == 0) return 0;
 
     int idx = 0, stopped = 0;
     while (1) {
         if (stopped) {
-            sceKernelDelayThread(20000);
+            sceKernelDelayThread(40000);
             save_volume_if_changed();
-            if (cmd != CMD_NONE) { cmd = CMD_NONE; stopped = 0; }
+            if (cmd != CMD_NONE) {
+                cmd = CMD_NONE;
+                stopped = 0;
+                is_stopped = 0;
+                fade = 0;                      /* fade the music back in */
+                fade_target = FADE_MAX;
+            }
             continue;
         }
 
@@ -392,6 +674,7 @@ static int decoder_thread(SceSize args, void *argp)
             flush_ring();
             clock_restore();
             stopped = 1;
+            is_stopped = 1;
         } else if (r == CMD_NEXT) {
             flush_ring();
             idx = (idx + 1) % nfiles;
@@ -414,6 +697,10 @@ int module_start(SceSize args, void *argp)
 
 int module_stop(SceSize args, void *argp)
 {
+    if (!is_stopped && ring_head != ring_tail) {      /* fade out before unloading */
+        fade_target = 0;
+        for (int i = 0; i < 80 && fade > 0; i++) sceKernelDelayThread(10000);
+    }
     clock_restore();
     return 0;
 }
