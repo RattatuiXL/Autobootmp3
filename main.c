@@ -3,8 +3,13 @@
  * Plays every .mp3 in ms0:/MUSIC automatically after the XMB loads.
  *   Note button, single press : next song
  *   Note button, double press : stop (press once to resume)
+ *   Hold Note + R trigger     : plugin volume up
+ *   Hold Note + L trigger     : plugin volume down
+ * The plugin volume is separate from the PSP volume keys and is remembered.
  *
- * Runs the CPU at a low clock: at 333 MHz the PSP-1000 adds white noise to the sound.
+ * The CPU clock is NOT touched by default. Optionally, ms0:/SEPLUGINS/AutoMusic.cfg
+ * can hold a number (33..333 = MHz used only while music plays; 0 = never touch).
+ * The original clock is saved first and restored when the music is stopped.
  * Two threads: a decoder thread fills a ring buffer, an output thread plays it.
  */
 #include <pspkernel.h>
@@ -22,17 +27,21 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 
 #define MUSIC_DIR    "ms0:/MUSIC/"
 #define DIR_LEN      11
+#define VOL_FILE     "ms0:/SEPLUGINS/AutoMusic.vol"
 #define START_DELAY  12000000      /* wait for the XMB to finish loading (us) */
 #define DOUBLE_US    350000        /* max gap between the two presses (us)    */
+#define VOL_REPEAT   180000        /* volume step repeat while held (us)      */
+#define VOL_MAX      16
 #define MAX_FILES    200
 #define NAME_LEN     128
 #define BUF_SZ       (32 * 1024)
 #define OUT_FRAMES   1152
 #define RING_BLOCKS  20            /* about 0.5 s of audio buffered           */
 #define PREBUFFER    6             /* blocks to collect before (re)starting   */
+#define RING_SPARE   4             /* blocks the decoder never writes into, so it
+                                      cannot overwrite what the hardware is playing */
 #define OUT_HZ       44100         /* normal PSP audio channel rate           */
-#define OUT_VOLUME   0x4000        /* full volume (use the PSP volume keys)   */
-#define CPU_MHZ      133           /* low clock = less noise; decoding needs little CPU */
+#define CFG_FILE     "ms0:/SEPLUGINS/AutoMusic.cfg"
 
 enum { CMD_NONE = 0, CMD_NEXT, CMD_TOGGLE };
 
@@ -50,42 +59,83 @@ static volatile int flush_req = 0;
 static volatile int cmd = CMD_NONE;
 static int blk_fill = 0;
 
-static unsigned int st_hz = 0, st_kbps = 0;
-static char lg[256];
-static int lg_n = 0;
+static volatile int vol_level = VOL_MAX;      /* 0..16, plugin volume      */
+static volatile int vol_dirty = 0;
 
-static void put_s(const char *s)
+/* ---- CPU clock: lowered only while music plays, original restored after ---- */
+static int clock_saved = 0, orig_cpu = 0, orig_bus = 0;
+static int cpu_target = 0;                           /* MHz, 0 = do not touch */
+
+static void load_config(void)
 {
-    while (*s && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = *s++;
+    char t[32];
+    SceUID f = sceIoOpen(CFG_FILE, PSP_O_RDONLY, 0);
+    if (f < 0) {                                     /* first run: write the default */
+        f = sceIoOpen(CFG_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+        if (f >= 0) { sceIoWrite(f, "0\r\n", 3); sceIoClose(f); }
+        return;
+    }
+    int n = sceIoRead(f, t, sizeof(t) - 1);
+    sceIoClose(f);
+    if (n <= 0) return;
+    t[n] = 0;
+
+    int i = 0, v = 0, have = 0;
+    while (t[i] && (t[i] < '0' || t[i] > '9')) i++;
+    while (t[i] >= '0' && t[i] <= '9' && v < 1000) { v = v * 10 + (t[i] - '0'); i++; have = 1; }
+    if (!have) return;
+    if (v == 0) cpu_target = 0;
+    else if (v < 33) cpu_target = 33;
+    else if (v > 333) cpu_target = 333;
+    else cpu_target = v;
 }
 
-static void put_n(unsigned int v)
+static void clock_low(void)
 {
-    char t[12];
-    int i = 0;
-    if (v == 0) t[i++] = '0';
-    while (v) { t[i++] = '0' + (v % 10); v /= 10; }
-    while (i && lg_n < (int)sizeof(lg) - 1) lg[lg_n++] = t[--i];
+    if (cpu_target == 0) return;                     /* user asked: never touch the clock */
+    int cpu = scePowerGetCpuClockFrequency();
+    if (cpu <= cpu_target + 10) return;              /* already low enough */
+    if (!clock_saved) {
+        orig_cpu = cpu;
+        orig_bus = scePowerGetBusClockFrequency();
+        clock_saved = 1;
+    }
+    scePowerSetClockFrequency(cpu_target, cpu_target, cpu_target / 2);
 }
 
-static void write_log(void)
+static void clock_restore(void)
 {
-    lg_n = 0;
-    put_s("cpu MHz: "); put_n(scePowerGetCpuClockFrequency());
-    put_s("  bus MHz: "); put_n(scePowerGetBusClockFrequency());
-    put_s("  song: "); put_n(st_hz); put_s(" Hz, "); put_n(st_kbps); put_s(" kbps\r\n");
-    SceUID f = sceIoOpen("ms0:/AutoMusic.log", PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
-    if (f >= 0) { sceIoWrite(f, lg, lg_n); sceIoClose(f); }
+    if (!clock_saved) return;
+    scePowerSetClockFrequency(orig_cpu, orig_cpu, orig_bus);
+    clock_saved = 0;
 }
 
-static void set_cpu_speed(void)
+/* ---- remembered volume ---- */
+static void load_volume(void)
 {
-    scePowerSetClockFrequency(CPU_MHZ, CPU_MHZ, CPU_MHZ / 2);
+    SceUID f = sceIoOpen(VOL_FILE, PSP_O_RDONLY, 0);
+    if (f < 0) return;
+    unsigned char v = 0;
+    if (sceIoRead(f, &v, 1) == 1 && v <= VOL_MAX) vol_level = v;
+    sceIoClose(f);
 }
 
-/* ---- Note button (output thread only): single = NEXT, double = TOGGLE ---- */
-static int was_down = 0, pending = 0, swallow = 0;
-static unsigned int rel_t = 0;
+static void save_volume_if_changed(void)
+{
+    if (!vol_dirty) return;
+    vol_dirty = 0;
+    SceUID f = sceIoOpen(VOL_FILE, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+    if (f < 0) return;
+    unsigned char v = (unsigned char)vol_level;
+    sceIoWrite(f, &v, 1);
+    sceIoClose(f);
+}
+
+/* ---- Note button (output thread only) ----
+ * single press = NEXT, double press = TOGGLE,
+ * Note held + R = louder, Note held + L = quieter                       */
+static int was_down = 0, pending = 0, swallow = 0, combo = 0;
+static unsigned int rel_t = 0, vol_t = 0;
 
 static void poll_button(void)
 {
@@ -101,10 +151,28 @@ static void poll_button(void)
     int down = (pad.Buttons & PSP_CTRL_NOTE) != 0;
 
     if (down && !was_down) {
+        combo = 0;
         if (pending) { pending = 0; swallow = 1; cmd = CMD_TOGGLE; }
     } else if (!down && was_down) {
         if (swallow) swallow = 0;
+        else if (combo) combo = 0;
         else { pending = 1; rel_t = now; }
+    }
+
+    if (down && !swallow) {
+        int step = 0;
+        if (pad.Buttons & PSP_CTRL_RTRIGGER) step = 1;
+        else if (pad.Buttons & PSP_CTRL_LTRIGGER) step = -1;
+        if (step) {
+            combo = 1;
+            if ((now - vol_t) >= VOL_REPEAT) {
+                vol_t = now;
+                int v = vol_level + step;
+                if (v < 0) v = 0;
+                if (v > VOL_MAX) v = VOL_MAX;
+                if (v != vol_level) { vol_level = v; vol_dirty = 1; }
+            }
+        }
     }
     was_down = down;
 }
@@ -150,7 +218,7 @@ static void scan(void)
             }
 }
 
-/* ---- output thread: plays ring buffer blocks, reads the Note button ---- */
+/* ---- output thread: plays ring buffer blocks, reads the buttons ---- */
 static int output_thread(SceSize args, void *argp)
 {
     int ch = -1, buffering = 1;
@@ -184,8 +252,10 @@ static int output_thread(SceSize args, void *argp)
                 continue;
             }
         }
+        int lv = vol_level;
+        int volume = lv * lv * 128;               /* 0 .. 0x8000, finer at low levels */
         sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
-        sceAudioOutputBlocking(ch, OUT_VOLUME, ring[slot]);
+        sceAudioOutputBlocking(ch, volume, ring[slot]);
         ring_tail++;
     }
     return 0;
@@ -202,7 +272,7 @@ static void flush_ring(void)
 
 static int wait_space(void)   /* returns 1 if a button command arrived */
 {
-    while ((ring_head - ring_tail) >= RING_BLOCKS - 2) {
+    while ((ring_head - ring_tail) >= RING_BLOCKS - RING_SPARE) {
         if (cmd != CMD_NONE) return 1;
         sceKernelDelayThread(3000);
     }
@@ -278,7 +348,6 @@ static int play_file(const char *path)
 
         mp3dec_frame_info_t info;
         int samples = mp3dec_decode_frame(&dec, buf + pos, avail, pcm, &info);
-        if (samples > 0) { st_hz = info.hz; st_kbps = info.bitrate_kbps; }
 
         if (info.frame_bytes > 0)  pos += info.frame_bytes;
         else if (eof)              break;
@@ -291,12 +360,9 @@ static int play_file(const char *path)
             break;
         }
 
-        /* keep the CPU clock low if something raised it (333 MHz = noise) */
-        if ((++tick & 255) == 0) {
-            if (scePowerGetCpuClockFrequency() > CPU_MHZ + 10)
-                set_cpu_speed();
-            write_log();
-        }
+        /* keep the CPU clock low while playing, in case something raised it */
+        if ((++tick & 255) == 0) clock_low();
+        save_volume_if_changed();
     }
 
     sceIoClose(fd);
@@ -306,22 +372,25 @@ static int play_file(const char *path)
 static int decoder_thread(SceSize args, void *argp)
 {
     sceKernelDelayThread(START_DELAY);
+    load_config();
+    load_volume();
     scan();
     if (nfiles == 0) return 0;
-
-    set_cpu_speed();
 
     int idx = 0, stopped = 0;
     while (1) {
         if (stopped) {
             sceKernelDelayThread(20000);
+            save_volume_if_changed();
             if (cmd != CMD_NONE) { cmd = CMD_NONE; stopped = 0; }
             continue;
         }
 
+        clock_low();
         int r = play_file(names[idx]);
         if (r == CMD_TOGGLE) {
             flush_ring();
+            clock_restore();
             stopped = 1;
         } else if (r == CMD_NEXT) {
             flush_ring();
@@ -345,5 +414,6 @@ int module_start(SceSize args, void *argp)
 
 int module_stop(SceSize args, void *argp)
 {
+    clock_restore();
     return 0;
 }
