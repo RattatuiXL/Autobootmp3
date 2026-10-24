@@ -191,22 +191,18 @@ static void format_time(char *out, unsigned int elapsed, unsigned int total)
 static void draw_disc(u32 base, int stride, int format, int cx, int cy,
                       int playing, unsigned int phase)
 {
-    static const signed char dx[8] = { 0, 7, 10, 7, 0, -7, -10, -7 };
-    static const signed char dy[8] = { -10, -7, 0, 7, 10, 7, 0, -7 };
+    static const signed char dx[8] = { 0, 6, 9, 6, 0, -6, -9, -6 };
+    static const signed char dy[8] = { -9, -6, 0, 6, 9, 6, 0, -6 };
     int x, y;
-    for (y = -13; y <= 13; y++) {
-        for (x = -13; x <= 13; x++) {
+    for (y = -10; y <= 10; y++) {
+        for (x = -10; x <= 10; x++) {
             int d = x * x + y * y;
-            if (d >= 125 && d <= 169)
-                pixel(base, stride, format, cx + x, cy + y, 205, 216, 232, 245);
-            else if (d >= 72 && d <= 85)
-                pixel(base, stride, format, cx + x, cy + y, 104, 119, 143, 210);
-            else if (d <= 12)
-                pixel(base, stride, format, cx + x, cy + y, 14, 20, 30, 255);
+            if ((d >= 81 && d <= 100) || (d >= 40 && d <= 52) || d <= 2)
+                pixel(base, stride, format, cx + x, cy + y, 255, 255, 255, 245);
         }
     }
     line(base, stride, format, cx, cy, cx + dx[phase & 7], cy + dy[phase & 7],
-         playing ? 98 : 139, playing ? 210 : 150, playing ? 255 : 162, 255);
+         255, 255, 255, playing ? 255 : 150);
 }
 
 void osd_draw(void *topaddr, int bufferwidth, int pixelformat,
@@ -214,8 +210,10 @@ void osd_draw(void *topaddr, int bufferwidth, int pixelformat,
               unsigned int total_frames, int playing,
               unsigned int animation_phase, unsigned int opacity)
 {
-    const int x = 148, y = 22, w = 320, h = 46;
-    const int progress_x = 200, progress_y = 56, progress_w = 254;
+    const int disc_x = 220, disc_y = 34;
+    const int title_x = 238, text_y = 25;
+    const int time_x = 382;
+    const int progress_x = 238, progress_y = 46, progress_w = 226;
     u32 base;
     char time_text[24];
     int fill;
@@ -226,25 +224,22 @@ void osd_draw(void *topaddr, int bufferwidth, int pixelformat,
     draw_opacity = opacity > 255 ? 255 : opacity;
     base = uncached_address(topaddr);
 
-    rect(base, bufferwidth, pixelformat, x, y, w, h, 7, 12, 20, 202);
-    rect(base, bufferwidth, pixelformat, x, y, w, 1, 83, 166, 220, 220);
-    rect(base, bufferwidth, pixelformat, x, y + h - 1, w, 1, 83, 166, 220, 190);
-    draw_disc(base, bufferwidth, pixelformat, 174, 45, playing,
+    draw_disc(base, bufferwidth, pixelformat, disc_x, disc_y, playing,
               playing ? animation_phase : 0);
 
-    draw_text(base, bufferwidth, pixelformat, 200, 28,
-              title, 30, 243, 247, 255, 255);
+    draw_text(base, bufferwidth, pixelformat, title_x, text_y,
+              title, 23, 255, 255, 255, 255);
     format_time(time_text, elapsed_frames, total_frames);
-    draw_text(base, bufferwidth, pixelformat, 392, 28,
-              time_text, 16, 203, 224, 244, 255);
+    draw_text(base, bufferwidth, pixelformat, time_x, text_y,
+              time_text, 14, 255, 255, 255, 255);
 
     rect(base, bufferwidth, pixelformat, progress_x, progress_y,
-         progress_w, 3, 67, 82, 101, 255);
+         progress_w, 2, 255, 255, 255, 90);
     if (total_frames) {
         if (elapsed_frames > total_frames) elapsed_frames = total_frames;
         fill = (int)muldiv_u32(progress_w, elapsed_frames, total_frames);
         if (fill > 0)
             rect(base, bufferwidth, pixelformat, progress_x, progress_y,
-                 fill, 3, 95, 198, 255, 255);
+                 fill, 2, 255, 255, 255, 255);
     }
 }
