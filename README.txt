@@ -2,6 +2,10 @@ AutoMusic - PSP kernel plugin for ARK-4.
 Plays ms0:/MUSIC/*.mp3 automatically on the XMB.
 Note button: short press = next song, double press = stop / resume.
 
+When another app starts playing audio, the music fades out and pauses. It
+automatically resumes with a fade in after the other audio ends. Short menu
+sound effects are ignored.
+
 download the AutoMusic artifact from the Actions tab -> AutoMusic.prx
 
 Install: copy AutoMusic.prx to ms0:/SEPLUGINS/ and add this line to
