@@ -7,8 +7,9 @@
  *   Hold Note + R trigger     : plugin volume down
  * The plugin volume is separate from the PSP volume keys and is remembered.
  *
- * When another sound starts (video, music player, ...) the music fades out and stops;
- * press Note once to start it again. Short menu sound effects are ignored.
+ * When another sound starts (video, music player, ...) the music fades out and
+ * pauses, then resumes with a fade in when the other sound ends. Short menu
+ * sound effects are ignored.
  *
  * Decode once: a song that plays through to the end is saved as raw sound in
  * ms0:/SEPLUGINS/AMCache/ ; the next time it plays straight from that file with no
@@ -89,6 +90,7 @@ static volatile int is_stopped = 0;           /* music stopped (set by decoder) 
 static volatile int autofade_on = 1;
 static volatile int detect_ready = 0;
 static volatile int auto_pause_pending = 0;
+static volatile int auto_stopped = 0;            /* paused by other-audio detection */
 static unsigned int ignore_mask = 0;          /* channels busy while the XMB was idle */
 
 /* ---- sound cache ---- */
@@ -414,7 +416,24 @@ static void poll_other_audio(int own)
         if (!is_stopped) { fade_target = 0; auto_pause_pending = 1; }
     } else if (other_playing && busy_us == 0) {
         other_playing = 0;
+        if (auto_pause_pending && !is_stopped) {
+            /* The competing sound ended before the fade-out completed. */
+            auto_pause_pending = 0;
+            fade_target = FADE_MAX;
+        }
     }
+}
+
+/* Wait in the current player's read loop, preserving its position and decoder state. */
+static int resume_after_auto_pause(int command)
+{
+    if (command != CMD_TOGGLE || !auto_stopped) return 0;
+
+    while (other_playing) sceKernelDelayThread(40000);
+    fade = 0;
+    fade_target = FADE_MAX;
+    auto_stopped = 0;
+    return 1;
 }
 
 /* ---- output thread: plays ring buffer blocks, reads the buttons ---- */
@@ -425,6 +444,12 @@ static int output_thread(SceSize args, void *argp)
     while (1) {
         poll_button();
         poll_other_audio(ch);
+
+        /* Hold the queued audio until the decoder resumes after the other sound ends. */
+        if (auto_stopped) {
+            sceKernelDelayThread(8000);
+            continue;
+        }
 
         if (flush_req) {
             ring_tail = ring_head;
@@ -462,7 +487,10 @@ static int output_thread(SceSize args, void *argp)
         int volume = (base * f) / FADE_MAX;
         if (f == 0 && auto_pause_pending) {       /* faded out: stop the music */
             auto_pause_pending = 0;
-            if (!is_stopped) cmd = CMD_TOGGLE;
+            if (!is_stopped) {
+                auto_stopped = 1;
+                cmd = CMD_TOGGLE;
+            }
         }
         sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
         sceAudioOutputBlocking(ch, volume, ring[slot]);
@@ -549,7 +577,12 @@ static int play_cached(const char *cpath, unsigned int mp3_size, int *result)
     blk_fill = 0;
 
     while (blocks_left > 0) {
-        if (cmd != CMD_NONE) { res = cmd; cmd = CMD_NONE; break; }
+        if (cmd != CMD_NONE) {
+            res = cmd;
+            cmd = CMD_NONE;
+            if (resume_after_auto_pause(res)) { res = CMD_NONE; continue; }
+            break;
+        }
 
         int freeb = (RING_BLOCKS - RING_SPARE) - (int)(ring_head - ring_tail);
         if (freeb >= CACHE_BATCH_MIN) {
@@ -602,7 +635,12 @@ static int play_file(const char *path)
     prev_l = prev_r = 0;
 
     while (1) {
-        if (cmd != CMD_NONE) { result = cmd; cmd = CMD_NONE; break; }
+        if (cmd != CMD_NONE) {
+            result = cmd;
+            cmd = CMD_NONE;
+            if (resume_after_auto_pause(result)) { result = CMD_NONE; continue; }
+            break;
+        }
 
         if (!eof && ((filled - pos) < BUF_SZ / 2 || need_more)) {
             if (pos > 0) {
@@ -629,6 +667,7 @@ static int play_file(const char *path)
         if (samples > 0 && push_frames(pcm, samples, info.channels, info.hz)) {
             result = cmd;
             cmd = CMD_NONE;
+            if (resume_after_auto_pause(result)) { result = CMD_NONE; continue; }
             break;
         }
 
@@ -658,10 +697,11 @@ static int decoder_thread(SceSize args, void *argp)
         if (stopped) {
             sceKernelDelayThread(40000);
             save_volume_if_changed();
-            if (cmd != CMD_NONE) {
+            if (cmd != CMD_NONE || (auto_stopped && !other_playing)) {
                 cmd = CMD_NONE;
                 stopped = 0;
                 is_stopped = 0;
+                auto_stopped = 0;
                 fade = 0;                      /* fade the music back in */
                 fade_target = FADE_MAX;
             }
@@ -675,6 +715,7 @@ static int decoder_thread(SceSize args, void *argp)
             clock_restore();
             stopped = 1;
             is_stopped = 1;
+            /* auto_stopped is set by the output thread only for auto-pauses. */
         } else if (r == CMD_NEXT) {
             flush_ring();
             idx = (idx + 1) % nfiles;
