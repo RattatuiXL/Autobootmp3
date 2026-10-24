@@ -1,14 +1,15 @@
 /*
  * AutoMusic - PSP kernel plugin (ARK-4, VSH/XMB)
  * Plays every .mp3 in ms0:/MUSIC automatically after the XMB loads.
- *   Note button, single press : next song
- *   Note button, double press : stop (press once to resume)
+ *   Note button, single press : stop / resume
+ *   Note button, double press : next song
  *   Hold Note + L trigger     : plugin volume up
  *   Hold Note + R trigger     : plugin volume down
  * The plugin volume is separate from the PSP volume keys and is remembered.
  *
- * When another sound starts (video, music player, ...) the music fades out and stops;
- * press Note once to start it again. Short menu sound effects are ignored.
+ * When another sound starts (video, music player, ...) the music fades out and
+ * pauses, then resumes with a fade in when the other sound ends. Short menu
+ * sound effects are ignored.
  *
  * Decode once: a song that plays through to the end is saved as raw sound in
  * ms0:/SEPLUGINS/AMCache/ ; the next time it plays straight from that file with no
@@ -25,7 +26,18 @@
 #include <pspaudio.h>
 #include <psppower.h>
 #include <pspiofilemgr.h>
+#include <psptypes.h>
 #include <string.h>
+
+#if __has_include(<systemctrl.h>)
+#include <systemctrl.h>
+#else
+u32 sctrlHENFindFunction(const char *szMod, const char *szLib, u32 nid);
+void sctrlHENPatchSyscall(void *addr, void *newaddr);
+#endif
+
+#include "osd.h"
+#include "muldiv.h"
 
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_ONLY_MP3
@@ -42,6 +54,7 @@ PSP_MODULE_INFO("AutoMusic", PSP_MODULE_KERNEL, 1, 0);
 #define VOL_MAX      16
 #define MAX_FILES    200
 #define NAME_LEN     128
+#define DISPLAY_NAME_LEN 64
 #define BUF_SZ       (32 * 1024)
 #define OUT_FRAMES   1152
 #define RING_BLOCKS  20            /* about 0.5 s of audio buffered           */
@@ -89,7 +102,139 @@ static volatile int is_stopped = 0;           /* music stopped (set by decoder) 
 static volatile int autofade_on = 1;
 static volatile int detect_ready = 0;
 static volatile int auto_pause_pending = 0;
+static volatile int auto_stopped = 0;            /* paused by other-audio detection */
 static unsigned int ignore_mask = 0;          /* channels busy while the XMB was idle */
+
+/* OSD state is shared with the display-flip hook. */
+static char display_name[DISPLAY_NAME_LEN];
+static volatile unsigned int display_elapsed_frames = 0;
+static volatile unsigned int display_total_frames = 0;
+static volatile int display_track_ready = 0;
+static volatile int display_menu_depth = 0;
+static int display_osd_opacity = 255;
+
+#define NID_SCE_DISPLAY_SET_FRAME_BUF 0x289D82FE
+static int (*display_set_frame_buf_orig)(void *topaddr, int bufferwidth,
+                                         int pixelformat, int sync) = NULL;
+static volatile int display_hook_inflight = 0;
+static volatile int display_hook_enabled = 0;
+
+static void display_track_begin(const char *path)
+{
+    char title[DISPLAY_NAME_LEN];
+    const char *base = path;
+    const char *end;
+    int i = 0, intr;
+    memset(title, 0, sizeof(title));
+    while (*path) {
+        if (*path == '/' || *path == '\\') base = path + 1;
+        path++;
+    }
+    end = base + strlen(base);
+    if (end - base >= 4 && end[-4] == '.') end -= 4;
+    while (base + i < end && i < DISPLAY_NAME_LEN - 1) {
+        title[i] = base[i];
+        i++;
+    }
+    title[i] = '\0';
+
+    intr = sceKernelCpuSuspendIntr();
+    memcpy(display_name, title, sizeof(display_name));
+    display_elapsed_frames = 0;
+    display_total_frames = 0;
+    display_track_ready = 1;
+    sceKernelCpuResumeIntr(intr);
+}
+
+static void display_set_total(unsigned int frames)
+{
+    int intr = sceKernelCpuSuspendIntr();
+    display_total_frames = frames;
+    sceKernelCpuResumeIntr(intr);
+}
+
+static void display_set_estimated_total(unsigned int file_bytes,
+                                        unsigned int bytes_seen,
+                                        unsigned int source_samples,
+                                        int source_hz)
+{
+    unsigned int total;
+    if (!bytes_seen || !source_samples || source_hz <= 0) return;
+    total = muldiv_u32(file_bytes, source_samples, bytes_seen);
+    total = muldiv_u32(total, OUT_HZ, (unsigned int)source_hz);
+    display_set_total(total);
+}
+
+static int display_set_frame_buf_hook(void *topaddr, int bufferwidth,
+                                      int pixelformat, int sync)
+{
+    char title[DISPLAY_NAME_LEN];
+    unsigned int elapsed, total, phase;
+    int opacity, target_opacity;
+    int ready, playing, intr;
+
+    intr = sceKernelCpuSuspendIntr();
+    display_hook_inflight++;
+    ready = display_track_ready;
+    if (ready) {
+        memcpy(title, display_name, sizeof(title));
+        elapsed = display_elapsed_frames;
+        total = display_total_frames;
+    }
+    playing = !is_stopped && !auto_stopped;
+    target_opacity = (display_menu_depth == 0 && !auto_stopped) ? 255 : 0;
+    sceKernelCpuResumeIntr(intr);
+
+    if (display_osd_opacity < target_opacity) {
+        display_osd_opacity += 16;
+        if (display_osd_opacity > target_opacity)
+            display_osd_opacity = target_opacity;
+    } else if (display_osd_opacity > target_opacity) {
+        display_osd_opacity -= 16;
+        if (display_osd_opacity < target_opacity)
+            display_osd_opacity = target_opacity;
+    }
+    opacity = display_osd_opacity;
+
+    if (ready && opacity > 0) {
+        phase = (unsigned int)(sceKernelGetSystemTimeLow() / 100000u);
+        osd_draw(topaddr, bufferwidth, pixelformat, title, elapsed, total,
+                 playing, phase, (unsigned int)opacity);
+    }
+
+    int result = display_set_frame_buf_orig(topaddr, bufferwidth, pixelformat, sync);
+    intr = sceKernelCpuSuspendIntr();
+    display_hook_inflight--;
+    sceKernelCpuResumeIntr(intr);
+    return result;
+}
+
+static void install_display_hook(void)
+{
+    u32 address = sctrlHENFindFunction("sceDisplay_Service", "sceDisplay",
+                                       NID_SCE_DISPLAY_SET_FRAME_BUF);
+    if (!address) return;
+    display_set_frame_buf_orig = (void *)address;
+    display_hook_enabled = 1;
+    sctrlHENPatchSyscall((void *)address, display_set_frame_buf_hook);
+}
+
+static void remove_display_hook(void)
+{
+    int intr;
+    if (!display_hook_enabled || !display_set_frame_buf_orig) return;
+    display_hook_enabled = 0;
+    sctrlHENPatchSyscall((void *)display_set_frame_buf_orig,
+                         (void *)display_set_frame_buf_orig);
+    do {
+        sceKernelDelayThread(1000);
+        intr = sceKernelCpuSuspendIntr();
+        int inflight = display_hook_inflight;
+        sceKernelCpuResumeIntr(intr);
+        if (!inflight) break;
+    } while (1);
+    display_set_frame_buf_orig = NULL;
+}
 
 /* ---- sound cache ---- */
 static int cache_limit_mb = 1024;                    /* 0 = off */
@@ -184,10 +329,11 @@ static void save_volume_if_changed(void)
 }
 
 /* ---- Note button (output thread only) ----
- * single press = NEXT, double press = TOGGLE,
+ * single press = TOGGLE, double press = NEXT,
  * Note held + L = louder, Note held + R = quieter                       */
 static int was_down = 0, pending = 0, swallow = 0, combo = 0;
 static unsigned int rel_t = 0, vol_t = 0;
+static unsigned int previous_menu_buttons = 0;
 
 static void poll_button(void)
 {
@@ -196,15 +342,25 @@ static void poll_button(void)
 
     if (pending && (now - rel_t) >= DOUBLE_US) {
         pending = 0;
-        cmd = CMD_NEXT;
+        cmd = CMD_TOGGLE;
     }
 
     if (sceCtrlPeekBufferPositive(&pad, 1) <= 0) return;
+    unsigned int menu_buttons = pad.Buttons &
+        (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE);
+    unsigned int entered = menu_buttons &
+        ~(previous_menu_buttons) & (PSP_CTRL_CROSS | PSP_CTRL_TRIANGLE);
+    if (entered && display_menu_depth < 8) display_menu_depth++;
+    if ((menu_buttons & PSP_CTRL_CIRCLE) &&
+        !(previous_menu_buttons & PSP_CTRL_CIRCLE) && display_menu_depth > 0)
+        display_menu_depth--;
+    previous_menu_buttons = menu_buttons;
+
     int down = (pad.Buttons & PSP_CTRL_NOTE) != 0;
 
     if (down && !was_down) {
         combo = 0;
-        if (pending) { pending = 0; swallow = 1; cmd = CMD_TOGGLE; }
+        if (pending) { pending = 0; swallow = 1; cmd = CMD_NEXT; }
     } else if (!down && was_down) {
         if (swallow) swallow = 0;
         else if (combo) combo = 0;
@@ -414,7 +570,24 @@ static void poll_other_audio(int own)
         if (!is_stopped) { fade_target = 0; auto_pause_pending = 1; }
     } else if (other_playing && busy_us == 0) {
         other_playing = 0;
+        if (auto_pause_pending && !is_stopped) {
+            /* The competing sound ended before the fade-out completed. */
+            auto_pause_pending = 0;
+            fade_target = FADE_MAX;
+        }
     }
+}
+
+/* Wait in the current player's read loop, preserving its position and decoder state. */
+static int resume_after_auto_pause(int command)
+{
+    if (command != CMD_TOGGLE || !auto_stopped) return 0;
+
+    while (other_playing) sceKernelDelayThread(40000);
+    fade = 0;
+    fade_target = FADE_MAX;
+    auto_stopped = 0;
+    return 1;
 }
 
 /* ---- output thread: plays ring buffer blocks, reads the buttons ---- */
@@ -425,6 +598,12 @@ static int output_thread(SceSize args, void *argp)
     while (1) {
         poll_button();
         poll_other_audio(ch);
+
+        /* Hold the queued audio until the decoder resumes after the other sound ends. */
+        if (auto_stopped) {
+            sceKernelDelayThread(8000);
+            continue;
+        }
 
         if (flush_req) {
             ring_tail = ring_head;
@@ -462,10 +641,18 @@ static int output_thread(SceSize args, void *argp)
         int volume = (base * f) / FADE_MAX;
         if (f == 0 && auto_pause_pending) {       /* faded out: stop the music */
             auto_pause_pending = 0;
-            if (!is_stopped) cmd = CMD_TOGGLE;
+            if (!is_stopped) {
+                auto_stopped = 1;
+                cmd = CMD_TOGGLE;
+            }
         }
         sceKernelDcacheWritebackRange(ring[slot], OUT_FRAMES * 2 * sizeof(short));
         sceAudioOutputBlocking(ch, volume, ring[slot]);
+        if (display_track_ready) {
+            int intr = sceKernelCpuSuspendIntr();
+            display_elapsed_frames += OUT_FRAMES;
+            sceKernelCpuResumeIntr(intr);
+        }
         ring_tail++;
     }
     return 0;
@@ -547,9 +734,15 @@ static int play_cached(const char *cpath, unsigned int mp3_size, int *result)
     unsigned int blocks_left = hdr[2];
     int tick = 0, res = CMD_NONE;
     blk_fill = 0;
+    display_set_total(blocks_left * OUT_FRAMES);
 
     while (blocks_left > 0) {
-        if (cmd != CMD_NONE) { res = cmd; cmd = CMD_NONE; break; }
+        if (cmd != CMD_NONE) {
+            res = cmd;
+            cmd = CMD_NONE;
+            if (resume_after_auto_pause(res)) { res = CMD_NONE; continue; }
+            break;
+        }
 
         int freeb = (RING_BLOCKS - RING_SPARE) - (int)(ring_head - ring_tail);
         if (freeb >= CACHE_BATCH_MIN) {
@@ -584,6 +777,8 @@ static int play_file(const char *path)
     SceUID fd = sceIoOpen(path, PSP_O_RDONLY, 0);
     if (fd < 0) { sceKernelDelayThread(500000); return CMD_NONE; }
 
+    display_track_begin(path);
+
     unsigned int mp3_size = (unsigned int)sceIoLseek32(fd, 0, PSP_SEEK_END);
     sceIoLseek32(fd, 0, PSP_SEEK_SET);
     char cpath[64];
@@ -595,14 +790,19 @@ static int play_file(const char *path)
     cache_begin(cpath, mp3_size);
 
     mp3dec_init(&dec);
-    unsigned int consumed = 0;
+    unsigned int consumed = 0, source_samples = 0;
     int pos = 0, filled = 0, eof = 0, need_more = 0, result = CMD_NONE, tick = 0;
     blk_fill = 0;
     rs_phase = 0;
     prev_l = prev_r = 0;
 
     while (1) {
-        if (cmd != CMD_NONE) { result = cmd; cmd = CMD_NONE; break; }
+        if (cmd != CMD_NONE) {
+            result = cmd;
+            cmd = CMD_NONE;
+            if (resume_after_auto_pause(result)) { result = CMD_NONE; continue; }
+            break;
+        }
 
         if (!eof && ((filled - pos) < BUF_SZ / 2 || need_more)) {
             if (pos > 0) {
@@ -626,9 +826,16 @@ static int play_file(const char *path)
         else if (avail >= BUF_SZ)  { pos += 1024; consumed += 1024; }
         else                       need_more = 1;
 
+        if (samples > 0 && info.frame_bytes > 0) {
+            source_samples += samples;
+            if ((tick & 31) == 0 || display_total_frames == 0)
+                display_set_estimated_total(mp3_size, consumed, source_samples, info.hz);
+        }
+
         if (samples > 0 && push_frames(pcm, samples, info.channels, info.hz)) {
             result = cmd;
             cmd = CMD_NONE;
+            if (resume_after_auto_pause(result)) { result = CMD_NONE; continue; }
             break;
         }
 
@@ -658,10 +865,13 @@ static int decoder_thread(SceSize args, void *argp)
         if (stopped) {
             sceKernelDelayThread(40000);
             save_volume_if_changed();
-            if (cmd != CMD_NONE) {
+            if (cmd != CMD_NONE || (auto_stopped && !other_playing)) {
+                int resume_cmd = cmd;
                 cmd = CMD_NONE;
+                if (resume_cmd == CMD_NEXT) idx = (idx + 1) % nfiles;
                 stopped = 0;
                 is_stopped = 0;
+                auto_stopped = 0;
                 fade = 0;                      /* fade the music back in */
                 fade_target = FADE_MAX;
             }
@@ -675,6 +885,7 @@ static int decoder_thread(SceSize args, void *argp)
             clock_restore();
             stopped = 1;
             is_stopped = 1;
+            /* auto_stopped is set by the output thread only for auto-pauses. */
         } else if (r == CMD_NEXT) {
             flush_ring();
             idx = (idx + 1) % nfiles;
@@ -687,6 +898,7 @@ static int decoder_thread(SceSize args, void *argp)
 
 int module_start(SceSize args, void *argp)
 {
+    install_display_hook();
     SceUID t1 = sceKernelCreateThread("AutoMusicOut", output_thread, 0x18, 0x4000, 0, NULL);
     if (t1 >= 0) sceKernelStartThread(t1, 0, NULL);
 
@@ -701,6 +913,7 @@ int module_stop(SceSize args, void *argp)
         fade_target = 0;
         for (int i = 0; i < 80 && fade > 0; i++) sceKernelDelayThread(10000);
     }
+    remove_display_hook();
     clock_restore();
     return 0;
 }
