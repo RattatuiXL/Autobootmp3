@@ -1,6 +1,7 @@
 #include <psptypes.h>
 #include <string.h>
 #include "osd.h"
+#include "muldiv.h"
 
 #define SCREEN_W 480
 #define SCREEN_H 272
@@ -28,7 +29,7 @@ static const unsigned char font[45][7] = {
     {17,17,10,4,4,4,4}, {31,1,2,4,8,16,31},
     {0,0,0,31,0,0,0}, {0,0,0,0,0,12,12},
     {0,4,4,0,4,4,0}, {1,2,4,8,16,0,0},
-    {14,17,1,2,4,0,4}, {0,0,0,31,0,0,0},
+    {14,17,1,2,4,0,4},
     {0,0,0,0,0,0,31}, {2,4,8,0,0,0,0},
     {4,4,4,4,4,0,4}
 };
@@ -236,7 +237,7 @@ void osd_draw(void *topaddr, int bufferwidth, int pixelformat,
          progress_w, 3, 67, 82, 101, 255);
     if (total_frames) {
         if (elapsed_frames > total_frames) elapsed_frames = total_frames;
-        fill = (int)(((unsigned long long)progress_w * elapsed_frames) / total_frames);
+        fill = (int)muldiv_u32(progress_w, elapsed_frames, total_frames);
         if (fill > 0)
             rect(base, bufferwidth, pixelformat, progress_x, progress_y,
                  fill, 3, 95, 198, 255, 255);

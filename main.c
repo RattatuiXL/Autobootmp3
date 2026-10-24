@@ -37,6 +37,7 @@ void sctrlHENPatchSyscall(void *addr, void *newaddr);
 #endif
 
 #include "osd.h"
+#include "muldiv.h"
 
 #define MINIMP3_IMPLEMENTATION
 #define MINIMP3_ONLY_MP3
@@ -155,12 +156,11 @@ static void display_set_estimated_total(unsigned int file_bytes,
                                         unsigned int source_samples,
                                         int source_hz)
 {
-    unsigned long long total;
+    unsigned int total;
     if (!bytes_seen || !source_samples || source_hz <= 0) return;
-    total = (unsigned long long)file_bytes * source_samples / bytes_seen;
-    total = total * OUT_HZ / (unsigned int)source_hz;
-    if (total > 0xFFFFFFFFu) total = 0xFFFFFFFFu;
-    display_set_total((unsigned int)total);
+    total = muldiv_u32(file_bytes, source_samples, bytes_seen);
+    total = muldiv_u32(total, OUT_HZ, (unsigned int)source_hz);
+    display_set_total(total);
 }
 
 static int display_set_frame_buf_hook(void *topaddr, int bufferwidth,
