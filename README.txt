@@ -6,8 +6,12 @@ When another app starts playing audio, the music fades out and pauses. It
 automatically resumes with a fade in after the other audio ends. Short menu
 sound effects are ignored.
 
-While a track is active, a small XMB overlay shows a spinning disc, the track
-name, elapsed and total time, and a playback progress bar.
+While a track is active, a compact overlay below the clock and battery at the
+top-right of the XMB shows a spinning disc, track name, elapsed and total time,
+and a playback progress bar. It fades out when opening an item with Cross or
+an options menu with Triangle, and while competing audio plays. It fades back
+in when you return to the top-level menu with Circle or when competing audio
+ends.
 
 The display-flip hook technique was informed by XMBuddy, an MIT-licensed PSP
 XMB overlay by Stefan Tsonev: https://github.com/StefanTsonev/XMBuddy

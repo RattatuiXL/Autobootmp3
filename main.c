@@ -110,6 +110,8 @@ static char display_name[DISPLAY_NAME_LEN];
 static volatile unsigned int display_elapsed_frames = 0;
 static volatile unsigned int display_total_frames = 0;
 static volatile int display_track_ready = 0;
+static volatile int display_menu_depth = 0;
+static int display_osd_opacity = 255;
 
 #define NID_SCE_DISPLAY_SET_FRAME_BUF 0x289D82FE
 static int (*display_set_frame_buf_orig)(void *topaddr, int bufferwidth,
@@ -168,6 +170,7 @@ static int display_set_frame_buf_hook(void *topaddr, int bufferwidth,
 {
     char title[DISPLAY_NAME_LEN];
     unsigned int elapsed, total, phase;
+    int opacity, target_opacity;
     int ready, playing, intr;
 
     intr = sceKernelCpuSuspendIntr();
@@ -179,12 +182,24 @@ static int display_set_frame_buf_hook(void *topaddr, int bufferwidth,
         total = display_total_frames;
     }
     playing = !is_stopped && !auto_stopped;
+    target_opacity = (display_menu_depth == 0 && !auto_stopped) ? 255 : 0;
     sceKernelCpuResumeIntr(intr);
 
-    if (ready) {
+    if (display_osd_opacity < target_opacity) {
+        display_osd_opacity += 16;
+        if (display_osd_opacity > target_opacity)
+            display_osd_opacity = target_opacity;
+    } else if (display_osd_opacity > target_opacity) {
+        display_osd_opacity -= 16;
+        if (display_osd_opacity < target_opacity)
+            display_osd_opacity = target_opacity;
+    }
+    opacity = display_osd_opacity;
+
+    if (ready && opacity > 0) {
         phase = (unsigned int)(sceKernelGetSystemTimeLow() / 100000u);
         osd_draw(topaddr, bufferwidth, pixelformat, title, elapsed, total,
-                 playing, phase);
+                 playing, phase, (unsigned int)opacity);
     }
 
     int result = display_set_frame_buf_orig(topaddr, bufferwidth, pixelformat, sync);
@@ -318,6 +333,7 @@ static void save_volume_if_changed(void)
  * Note held + L = louder, Note held + R = quieter                       */
 static int was_down = 0, pending = 0, swallow = 0, combo = 0;
 static unsigned int rel_t = 0, vol_t = 0;
+static unsigned int previous_menu_buttons = 0;
 
 static void poll_button(void)
 {
@@ -330,6 +346,16 @@ static void poll_button(void)
     }
 
     if (sceCtrlPeekBufferPositive(&pad, 1) <= 0) return;
+    unsigned int menu_buttons = pad.Buttons &
+        (PSP_CTRL_CROSS | PSP_CTRL_CIRCLE | PSP_CTRL_TRIANGLE);
+    unsigned int entered = menu_buttons &
+        ~(previous_menu_buttons) & (PSP_CTRL_CROSS | PSP_CTRL_TRIANGLE);
+    if (entered && display_menu_depth < 8) display_menu_depth++;
+    if ((menu_buttons & PSP_CTRL_CIRCLE) &&
+        !(previous_menu_buttons & PSP_CTRL_CIRCLE) && display_menu_depth > 0)
+        display_menu_depth--;
+    previous_menu_buttons = menu_buttons;
+
     int down = (pad.Buttons & PSP_CTRL_NOTE) != 0;
 
     if (down && !was_down) {

@@ -7,6 +7,8 @@
 #define SCREEN_H 272
 #define OUT_HZ 44100
 
+static unsigned int draw_opacity = 255;
+
 static const unsigned char font[45][7] = {
     {0,0,0,0,0,0,0},
     {14,17,19,21,25,17,14}, {4,12,4,4,4,4,14},
@@ -57,6 +59,8 @@ static void pixel(u32 base, int stride, int format, int x, int y,
                   int r, int g, int b, int alpha)
 {
     if (!inside(x, y)) return;
+    alpha = (alpha * (int)draw_opacity) / 255;
+    if (alpha <= 0) return;
     if (format == 3) {
         u32 *p = (u32 *)(base + ((u32)y * stride + x) * 4u);
         u32 d = *p;
@@ -208,29 +212,30 @@ static void draw_disc(u32 base, int stride, int format, int cx, int cy,
 void osd_draw(void *topaddr, int bufferwidth, int pixelformat,
               const char *title, unsigned int elapsed_frames,
               unsigned int total_frames, int playing,
-              unsigned int animation_phase)
+              unsigned int animation_phase, unsigned int opacity)
 {
-    const int x = 12, y = 216, w = 456, h = 46;
-    const int progress_x = 66, progress_y = 250, progress_w = 386;
+    const int x = 148, y = 22, w = 320, h = 46;
+    const int progress_x = 200, progress_y = 56, progress_w = 254;
     u32 base;
     char time_text[24];
     int fill;
 
     if (!topaddr || bufferwidth < SCREEN_W || bufferwidth > 1024 ||
-        pixelformat < 0 || pixelformat > 3)
+        pixelformat < 0 || pixelformat > 3 || opacity == 0)
         return;
+    draw_opacity = opacity > 255 ? 255 : opacity;
     base = uncached_address(topaddr);
 
     rect(base, bufferwidth, pixelformat, x, y, w, h, 7, 12, 20, 202);
     rect(base, bufferwidth, pixelformat, x, y, w, 1, 83, 166, 220, 220);
     rect(base, bufferwidth, pixelformat, x, y + h - 1, w, 1, 83, 166, 220, 190);
-    draw_disc(base, bufferwidth, pixelformat, 38, 239, playing,
+    draw_disc(base, bufferwidth, pixelformat, 174, 45, playing,
               playing ? animation_phase : 0);
 
-    draw_text(base, bufferwidth, pixelformat, 64, 222,
-              title, 47, 243, 247, 255, 255);
+    draw_text(base, bufferwidth, pixelformat, 200, 28,
+              title, 30, 243, 247, 255, 255);
     format_time(time_text, elapsed_frames, total_frames);
-    draw_text(base, bufferwidth, pixelformat, 364, 222,
+    draw_text(base, bufferwidth, pixelformat, 392, 28,
               time_text, 16, 203, 224, 244, 255);
 
     rect(base, bufferwidth, pixelformat, progress_x, progress_y,
